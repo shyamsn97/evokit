@@ -47,17 +47,17 @@ clean-test: ## remove test and coverage artifacts
 	rm -fr .pytest_cache
 
 lint: ## check style with flake8
-	isort --profile black PYTHON_PATH_NAME
-	black PYTHON_PATH_NAME
-	flake8 PYTHON_PATH_NAME
+	isort --profile black evokit
+	black evokit
+	flake8 evokit
 
 install: clean lint
 	python -m pip install . --upgrade
 
 doc:
 	rm -r docs/reference/
-	pdocs as_markdown PYTHON_PATH_NAME -o docs/reference
-	rm docs/reference/PACKAGE_NAME/index.md
+	pdocs as_markdown evokit -o docs/reference
+	rm docs/reference/evokit/index.md
 	cp examples/*.ipynb docs/examples/
 	cp README.md docs/index.md
 
@@ -69,7 +69,7 @@ commit: install test doc
 	git commit -a
 
 test:
-	python -m pytest --cov=PYTHON_PATH_NAME/ --cov-report html:tests/cov-report tests/
+	python -m pytest --cov=evokit/ --cov-report html:tests/cov-report tests/
 
 test-html: test
 	$(BROWSER) tests/cov-report/index.html
