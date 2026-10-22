@@ -1,0 +1,6 @@
+{
+  "note": "Best known sums of radii, used to normalize scores. 26 and 32 are the values reported by AlphaEvolve; 20 is an estimate, 2.635 * sqrt(20 / 26).",
+  "20": 2.311,
+  "26": 2.635,
+  "32": 2.937
+}

@@ -1,16 +1,34 @@
-# https://godatadriven.com/blog/minimal-pyproject-toml-example/
-# https://peps.python.org/pep-0621/
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "evokit"
-requires-python = ">=3.8"
+description = "Evolutionary search where the variation operator can be a coding agent."
+requires-python = ">=3.10"
 readme = "README.md"
-version = "0.0.0"
+version = "0.1.0"
+license = { text = "MIT" }
 authors = [
     { name = "Shyam Sudhakaran", email = "shyamsnair@protonmail.com" }
 ]
 dependencies = [
+    "click>=8.1",
+    "pyyaml>=6",
 ]
+
 [project.optional-dependencies]
-dev = [
-]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8", "mcp>=1.2"]
+
+[project.scripts]
+evokit = "evokit.interface.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["evokit*"]
+
+[tool.setuptools.package-data]
+evokit = ["templates/task/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

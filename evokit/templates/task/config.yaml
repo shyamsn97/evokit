@@ -1,0 +1,23 @@
+# An evokit task. `evokit run --task THIS_FOLDER --dir RUN_DIR` creates the run (seeded with the
+# genome files below) or continues it. In Python: `evokit.load_task("THIS_FOLDER")`.
+
+task:
+  genome: [main.py]             # the files that evolve (glob patterns); everything else is the fixed environment
+  evaluate: python evaluate.py  # run in a copy of this folder; see evaluate.py for the contract
+  timeout: 2m
+  objective: score              # the metric evaluate.py prints that the archive ranks by
+  minimize: false
+  # ignore: [data/cache/**]     # files that are neither genome nor environment
+
+run:                            # the components; every key is optional
+  archive: best                 # best | simpler | population | islands | unbounded | latest
+  strategy: greedy              # greedy | tournament | proportional | islands
+  operator: none                # none (you evaluate genomes yourself) | diff | rewrite | coding-agent
+  # model: claude-sonnet-4-5    # for diff and rewrite (AnthropicModel; needs ANTHROPIC_API_KEY)
+  # price: [3.0, 15.0]          # USD per million input and output tokens, so --max-cost can stop the run
+  # agent: claude               # for coding-agent: claude (Claude Code), or a command run in the individual's folder
+  # archive_options: {size: 20}               # keyword arguments for the archive
+  # strategy_options: {size: 3}               # ... the strategy
+  # operator_options: {max_draft_evals: 5}    # ... the operator (coding-agent: drafts scored by evaluate)
+  # factory: evo:build          # instead of the keys above: build(task, storage) in evo.py returns
+  #                             # the archive, strategy, operator, and any objects with commands

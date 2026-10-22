@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="470" viewBox="0 0 920 470" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/>
+    </marker>
+    <style>
+      .h { font-size: 16px; font-weight: 600; fill: #1f2328; }
+      .s { font-size: 12.5px; fill: #656d76; }
+      .n { font-size: 14px; font-weight: 600; fill: #1f2328; }
+      .tag { font-size: 10.5px; font-weight: 600; letter-spacing: 0.6px; fill: #656d76; }
+      .a { stroke: #8c959f; stroke-width: 1.5; fill: none; }
+    </style>
+  </defs>
+
+  <rect width="920" height="470" fill="#ffffff"/>
+
+  <!-- interface -->
+  <rect x="40.5" y="28.5" width="839" height="52" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="62" y="60" class="h">Interface</text>
+  <rect x="148.5" y="45.5" width="66" height="18" rx="9" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="181.5" y="58" text-anchor="middle" class="tag">OPTIONAL</text>
+  <text x="858" y="59" text-anchor="end" class="s">CLI  /  MCP server  /  SKILL.md  /  Python tools</text>
+
+  <line x1="460" y1="81" x2="460" y2="106" class="a" marker-end="url(#head)"/>
+
+  <!-- engine -->
+  <rect x="40.5" y="110.5" width="839" height="250" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="62" y="142" class="h">Engine</text>
+  <text x="124" y="142" class="s">runs the loop: select, create, evaluate, add</text>
+
+  <rect x="62.5" y="228.5" width="110" height="74" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="117.5" y="261" text-anchor="middle" class="n">Strategy</text>
+  <text x="117.5" y="281" text-anchor="middle" class="s">selects</text>
+  <rect x="202.5" y="228.5" width="110" height="74" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="257.5" y="261" text-anchor="middle" class="n">Operator</text>
+  <text x="257.5" y="281" text-anchor="middle" class="s">creates</text>
+
+  <!-- experiment, inside the engine -->
+  <rect x="342.5" y="172.5" width="516" height="150" rx="10" fill="#eaeef2" stroke="#d0d7de"/>
+  <text x="362" y="200" class="h">Experiment</text>
+  <text x="456" y="200" class="s">the problem and its results</text>
+
+  <rect x="362.5" y="228.5" width="140" height="74" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="432.5" y="261" text-anchor="middle" class="n">Evaluator</text>
+  <text x="432.5" y="281" text-anchor="middle" class="s">scores</text>
+  <rect x="530.5" y="228.5" width="140" height="74" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="600.5" y="261" text-anchor="middle" class="n">Archive</text>
+  <text x="600.5" y="281" text-anchor="middle" class="s">keeps survivors</text>
+  <rect x="698.5" y="228.5" width="140" height="74" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="768.5" y="261" text-anchor="middle" class="n">Store</text>
+  <text x="768.5" y="281" text-anchor="middle" class="s">persists</text>
+
+  <!-- the loop -->
+  <line x1="173" y1="265.5" x2="199" y2="265.5" class="a" marker-end="url(#head)"/>
+  <line x1="313" y1="265.5" x2="359" y2="265.5" class="a" marker-end="url(#head)"/>
+  <line x1="503" y1="265.5" x2="527" y2="265.5" class="a" marker-end="url(#head)"/>
+  <path d="M600.5,303 V340.5 H117.5 V306" class="a" marker-end="url(#head)"/>
+
+  <line x1="460" y1="390" x2="460" y2="365" class="a" marker-end="url(#head)"/>
+
+  <!-- files -->
+  <rect x="40.5" y="392.5" width="839" height="52" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="62" y="424" class="h">Files</text>
+  <rect x="116.5" y="409.5" width="66" height="18" rx="9" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="149.5" y="422" text-anchor="middle" class="tag">OPTIONAL</text>
+  <text x="858" y="423" text-anchor="end" class="s">genomes that are files in a project directory</text>
+</svg>

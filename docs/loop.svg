@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="520" viewBox="0 0 860 520" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#57606a"/>
+    </marker>
+    <marker id="headLight" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8c959f"/>
+    </marker>
+    <style>
+      .n { font-size: 15px; font-weight: 600; fill: #1f2328; }
+      .s { font-size: 12.5px; fill: #656d76; }
+      .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; fill: #1f2328; }
+      .num { font-size: 11.5px; font-weight: 700; fill: #ffffff; }
+      .a { stroke: #57606a; stroke-width: 1.6; fill: none; }
+      .t { stroke: #8c959f; stroke-width: 1.3; stroke-dasharray: 4 4; fill: none; }
+      .eng { fill: #ffffff; stroke: #d0d7de; }
+      .exp { fill: #eaeef2; stroke: #d0d7de; }
+    </style>
+  </defs>
+
+  <rect width="860" height="520" fill="#ffffff"/>
+
+  <!-- components -->
+  <rect x="340.5" y="40.5" width="180" height="70" rx="10" class="eng"/>
+  <text x="430" y="70" text-anchor="middle" class="n">Operator</text>
+  <text x="430" y="90" text-anchor="middle" class="s">makes a new individual</text>
+
+  <rect x="60.5" y="190.5" width="180" height="70" rx="10" class="eng"/>
+  <text x="150" y="220" text-anchor="middle" class="n">Strategy</text>
+  <text x="150" y="240" text-anchor="middle" class="s">picks what to build on</text>
+
+  <rect x="620.5" y="190.5" width="180" height="70" rx="10" class="exp"/>
+  <text x="710" y="220" text-anchor="middle" class="n">Evaluator</text>
+  <text x="710" y="240" text-anchor="middle" class="s">scores it</text>
+
+  <rect x="340.5" y="340.5" width="180" height="70" rx="10" class="exp"/>
+  <text x="430" y="370" text-anchor="middle" class="n">Archive</text>
+  <text x="430" y="390" text-anchor="middle" class="s">keeps the survivors</text>
+
+  <!-- 1 select: strategy -> operator -->
+  <path d="M150,190 V75.5 H336" class="a" marker-end="url(#head)"/>
+  <circle cx="170" cy="58" r="10" fill="#1f2328"/>
+  <text x="170" y="62" text-anchor="middle" class="num">1</text>
+  <text x="186" y="62" class="code">select_individuals</text>
+
+  <!-- 2 create: operator -> evaluator -->
+  <path d="M521,75.5 H710 V186" class="a" marker-end="url(#head)"/>
+  <circle cx="542" cy="58" r="10" fill="#1f2328"/>
+  <text x="542" y="62" text-anchor="middle" class="num">2</text>
+  <text x="558" y="62" class="code">create_individual</text>
+
+  <!-- 3 evaluate: evaluator -> archive -->
+  <path d="M710,261 V375.5 H525" class="a" marker-end="url(#head)"/>
+  <circle cx="536" cy="358" r="10" fill="#1f2328"/>
+  <text x="536" y="362" text-anchor="middle" class="num">3</text>
+  <text x="552" y="362" class="code">evaluate_individual</text>
+
+  <!-- 4 add: archive -> strategy -->
+  <path d="M340,375.5 H150 V265" class="a" marker-end="url(#head)"/>
+  <circle cx="176" cy="358" r="10" fill="#1f2328"/>
+  <text x="176" y="362" text-anchor="middle" class="num">4</text>
+  <text x="192" y="362" class="code">add_individual</text>
+
+  <!-- 5 tell: admitted? back to strategy and operator -->
+  <rect x="345.5" y="208.5" width="170" height="34" rx="17" fill="#ffffff" stroke="#8c959f" stroke-dasharray="4 4"/>
+  <circle cx="368" cy="225.5" r="10" fill="#1f2328"/>
+  <text x="368" y="229.5" text-anchor="middle" class="num">5</text>
+  <text x="384" y="230" class="code">tell(admitted)</text>
+  <line x1="430.5" y1="340" x2="430.5" y2="247" class="t" marker-end="url(#headLight)"/>
+  <line x1="345" y1="225.5" x2="245" y2="225.5" class="t" marker-end="url(#headLight)"/>
+  <line x1="430.5" y1="208" x2="430.5" y2="115" class="t" marker-end="url(#headLight)"/>
+
+  <!-- legend -->
+  <line x1="60" y1="450.5" x2="800" y2="450.5" stroke="#eaeef2"/>
+  <rect x="60.5" y="472.5" width="16" height="16" rx="4" class="eng"/>
+  <text x="86" y="485" class="s"><tspan font-weight="600" fill="#1f2328">Engine</tspan>  owns the strategy and operator, and runs the loop</text>
+  <rect x="440.5" y="472.5" width="16" height="16" rx="4" class="exp"/>
+  <text x="466" y="485" class="s"><tspan font-weight="600" fill="#1f2328">Experiment</tspan>  owns these, plus the Store and Budget</text>
+</svg>
