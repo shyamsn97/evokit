@@ -14,7 +14,7 @@ from evokit.files.tree import Files
 from evokit.operator import Operator
 from evokit.records import Individual, Offspring, Selection, merge_usage
 from evokit.storage import Storage
-from evokit.util import truncate
+from evokit.util import title_and_body, truncate
 
 DIAGNOSE = """This directory is your own source code: a coding agent, run as \
 `python {entrypoint} --dir WORKDIR --task TASK`. ./{logs} holds the logs of your last evaluation, where \
@@ -113,9 +113,6 @@ class SelfModify(Operator):
                 raise OperatorError("the agent did not change its code", usage)
         finally:
             shutil.rmtree(root, ignore_errors=True)
-        info = {
-            "operator": self.name,
-            "proposal": truncate(proposal, 4000),
-            "summary": truncate(implementation.summary, 2000),
-        }
-        return Offspring((Individual.new(child, [parent.id], info),), usage)
+        name, description = title_and_body(implementation.summary)
+        info = {"operator": self.name, "proposal": truncate(proposal, 4000)}
+        return Offspring((Individual.new(child, [parent.id], info, name=name, description=truncate(description, 2000)),), usage)

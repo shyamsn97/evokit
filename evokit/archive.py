@@ -18,6 +18,28 @@ from evokit.records import Individual
 from evokit.storage import Storage, append_json, decode, encode, read_json_lines
 
 
+def _replay(storage: Storage, log: str) -> tuple[dict[str, Individual], dict[str, dict], dict[str, Any]]:
+    members: dict[str, Individual] = {}
+    metadata: dict[str, dict] = {}
+    state: dict[str, Any] = {}
+    for change in read_json_lines(storage, log):
+        if "state" in change:
+            state = change["state"]
+        elif "removed" in change:
+            members.pop(change["removed"], None)
+            metadata.pop(change["removed"], None)
+        else:
+            individual = decode(change["inserted"], storage)
+            members[individual.id] = individual
+            metadata[individual.id] = change["metadata"]
+    return members, metadata, state
+
+
+def read_members(storage: Storage, name: str = "archive") -> dict[str, Individual]:
+    """An archive's current members by id, from its log alone (no archive class needed)."""
+    return _replay(storage, f"{name}/changes.jsonl")[0]
+
+
 class Archive(ABC):
     def __init__(self, storage: Storage | None = None, name: str = "archive"):
         self.storage = storage
@@ -26,16 +48,7 @@ class Archive(ABC):
         self.metadata: dict[str, dict] = {}
         self.state: dict[str, Any] = {}
         if storage is not None:
-            for change in read_json_lines(storage, self.log):
-                if "state" in change:
-                    self.state = change["state"]
-                elif "removed" in change:
-                    self._members.pop(change["removed"], None)
-                    self.metadata.pop(change["removed"], None)
-                else:
-                    individual = decode(change["inserted"], storage)
-                    self._members[individual.id] = individual
-                    self.metadata[individual.id] = change["metadata"]
+            self._members, self.metadata, self.state = _replay(storage, self.log)
 
     @abstractmethod
     def add(self, individual: Individual) -> bool:

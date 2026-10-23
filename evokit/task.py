@@ -98,7 +98,7 @@ class Task:
 
     def seed(self) -> Individual:
         """The task's genome files as they are now, as a fresh individual."""
-        return Individual.new(self.project.seed_genome(), info={"note": "seed"})
+        return Individual.new(self.project.seed_genome(), name="seed")
 
     def components(self, storage: Storage) -> tuple[Archive, Strategy, Operator | None]:
         """The archive (on `storage`, so it restores itself), strategy and operator the `run` section names."""

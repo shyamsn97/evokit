@@ -84,7 +84,7 @@ evokit skill export claude --dir runs/autoresearch-external-0
 ```
 
 Each step is `select-individuals`, `checkout-individual ID DIR`, an edit, then
-`evaluate-directory DIR --parent ID --note "..."`, which evaluates and tells; the result's
+`evaluate-directory DIR --parent ID --name "..." --description "..."`, which evaluates and tells; the result's
 `info.admitted` says whether the change was kept. In `unattended`, a
 `CodingAgentOperator(ClaudeCode(), project)` makes each change in a fresh session.
 
@@ -97,29 +97,29 @@ experiment.run(evaluate_with_lines, workers=1, max_cost=5)
 ## 2. AVO
 
 **What it is.** AVO (agentic variation operators) replaces one-shot LLM mutation with a coding
-agent in one continuing session. The agent edits, tests drafts, and commits; the lineage
-moves forward on any change that is correct and not worse; and a supervisor redirects the
-agent after a run of rejections.
+agent in one continuous session. The agent reads earlier versions, tests drafts as often as it
+likes, and commits when a version is ready; the lineage moves forward on any commit that is
+correct and not worse; and a supervisor reviews the run and suggests new directions when it
+stalls. Details and the paper's quotes: [avo.md](avo.md).
 
 **How it maps** ([avo.py](../examples/circle_packing/algorithms/avo.py)).
 
 | AVO | EvoKit |
 | --- | --- |
 | commit if correct and not worse | `BestArchive(ties="accept")`; invalid packings already fail |
-| continue from the lineage head | `Greedy()` |
-| one agent session across all steps | `CodingAgentOperator(..., persistent_session=True)`, resumed with `--resume` |
-| the agent tests drafts as it works | `draft_evaluate=evaluate, max_draft_evals=10`, through `$EVOKIT_DRAFT_EVAL`; drafts count toward the limits |
-| the supervisor | `redirect_after=5`: after five rejections in a row, the next prompt says to step back and try something different |
+| the agent commits | `$EVOKIT_COMMIT "title" "description"`: recorded, evaluated and told at once; the reply is the verdict |
+| one agent session across the run | one Claude Code session, resumed with "continue" while no limit is reached |
+| the agent tests drafts as it works | `$EVOKIT_DRAFT_EVAL`, no limit by default |
+| the lineage P_t | `evokit log --all`, `show`, `diff`, `grep` |
+| the supervisor | after 5 drafts and commits without a strictly better score, a fresh session reads the run and names 3 to 5 directions |
 
 ```python
-operator = CodingAgentOperator(ClaudeCode(), project, draft_evaluate=evaluate, max_draft_evals=10,
-                               persistent_session=True, redirect_after=5)
-experiment = Experiment(BestArchive(ties="accept"), Greedy(), operator, seeds=[project.seed_genome()])
-experiment.run(evaluate, workers=1, max_cost=5)
+archive = BestArchive("score", ties="accept", storage=storage)   # seeded
+await recipes.avo(project, evaluate, ClaudeCode(), storage=storage, archive=archive, max_cost=5)
 ```
 
-One session cannot serve two workers: called concurrently, the operator raises a `UsageError`,
-so AVO runs with `workers=1`.
+Limits are checked on every draft and commit (the reply then says `"stop"`), and each start or
+resume of the session gets the remaining budget as Claude Code's `--max-budget-usd`.
 
 ## 3. AlphaEvolve / OpenEvolve
 

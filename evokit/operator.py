@@ -23,6 +23,10 @@ class Operator(ABC):
     @abstractmethod
     async def create(self, selection: Selection, archive: "Archive") -> Offspring: ...
 
+    async def check(self) -> None:
+        """Raise UsageError if this operator cannot create anything (bad credentials, an unknown
+        model). Loops call it once, before they start. A no-op by default."""
+
 
 class Mutate(Operator):
     """The simplest operator: a function from the parents' genomes to a new genome, sync or async.

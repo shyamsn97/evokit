@@ -22,11 +22,13 @@ def command(
     name: str | None = None,
     surfaces: Iterable[str] = SURFACES,
     result: Callable[[Any, Any], Any] | None = None,
+    positional: Iterable[str] = (),
 ):
     """Mark a method as an agent-facing command.
 
     `result(owner, value)` optionally reshapes the return value for JSON surfaces
-    (CLI and MCP); Python tools always get the raw value.
+    (CLI and MCP); Python tools always get the raw value. On the command line, required
+    parameters and individuals are positional, and so are the optional ones named in `positional`.
     """
 
     def mark(f: Callable) -> Callable:
@@ -34,6 +36,7 @@ def command(
             "name": (name or f.__name__).replace("_", "-"),
             "surfaces": frozenset(surfaces),
             "result": result,
+            "positional": frozenset(positional),
         }
         return f
 
@@ -107,6 +110,8 @@ def encode(value: Any) -> Any:
     if isinstance(value, Individual):
         return {
             "id": value.id,
+            "name": value.name,
+            "description": value.description,
             "genome": encode(value.genome),
             "parents": list(value.parents),
             "evaluation": encode(value.evaluation),

@@ -17,9 +17,9 @@ reads a task folder (TASK.md, config.yaml, evaluate.py, the genome files) into t
 
 from evokit import archives, history, operators, storages, strategies
 from evokit.archive import Archive
-from evokit.errors import EnvironmentModified, EvoError, OperatorError, UsageError
+from evokit.errors import EnvironmentModified, EvoError, OperatorError, RunBusy, UsageError
 from evokit.interface.commands import command, tools
-from evokit.loop import EvalFn, ask, call_eval_fn, evaluate, tell
+from evokit.loop import EvalFn, Limits, ask, call_eval_fn, evaluate, tell
 from evokit.operator import Mutate, Operator
 from evokit.records import Asked, Evaluation, Failure, Individual, Offspring, Selection
 from evokit.storage import Storage
@@ -37,10 +37,12 @@ __all__ = [
     "Evaluation",
     "Failure",
     "Individual",
+    "Limits",
     "Mutate",
     "Offspring",
     "Operator",
     "OperatorError",
+    "RunBusy",
     "Selection",
     "Storage",
     "Strategy",

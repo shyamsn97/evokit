@@ -52,15 +52,98 @@ def test_autoresearch_unattended(tmp_path):
     assert len(rows) == 3 and rows[0].split("\t")[2] == "keep"
 
 
-def test_avo_keeps_one_session_and_scores_drafts(tmp_path):
+class CommittingAgent(CodingAgent):
+    """AVO's agent, scripted: each session drafts and commits twice, a better version and then a
+    tie (one more blank line), and stops when a reply says so. As the supervisor, it names a direction."""
+
+    def __init__(self):
+        self.prompts, self.sessions, self.replies, self.supervisor_prompts = [], [], [], []
+
+    async def call(self, script, *args):
+        proc = await asyncio.to_thread(subprocess.run, [script, *args], capture_output=True, text=True)
+        reply = json.loads(proc.stdout)
+        self.replies.append(reply)
+        return reply
+
+    async def run(self, directory, prompt, session=None, env=None):
+        if "EVOKIT_COMMIT" not in env:
+            self.supervisor_prompts.append(prompt)
+            return AgentResult("1. Try a hexagonal outer ring.", usage={"cost_usd": 0.01})
+        self.prompts.append(prompt)
+        self.sessions.append(session)
+        main = Path(directory) / "main.py"
+        for change in (widen_outer_ring, lambda text: text + "\n"):
+            main.write_text(change(main.read_text()))
+            draft = await self.call(env["EVOKIT_DRAFT_EVAL"])
+            if "stop" in draft:
+                break
+            if "stop" in await self.call(env["EVOKIT_COMMIT"], "a change", f"draft score {draft['objectives']}"):
+                break
+        return AgentResult("done for now", usage={"cost_usd": 0.01}, session="session-1")
+
+
+def test_avo_one_session_commits_and_a_supervisor_redirects(tmp_path):
     from algorithms import avo
 
-    agent = ScriptedAgent()
-    storage, archive = asyncio.run(avo.run(str(tmp_path / "run"), agent=agent, max_evaluations=4))
-    assert agent.sessions == [None, "session-1", "session-1"]
-    assert all('"score"' in d for d in agent.drafts) and len(agent.drafts) == 3
+    agent = CommittingAgent()
+    storage, archive = asyncio.run(avo.run(str(tmp_path / "run"), agent=agent, max_evaluations=11, stall_after=6))
+    commits = [r for r in agent.replies if "kept" in r]
+    kept = [r["kept"] for r in commits]
+    assert kept == [True] * 6 + [False] * 4  # widening helps three times, then regresses; ties are kept
+    assert agent.sessions == [None] + ["session-1"] * 4
+    assert "evokit log --all" in agent.prompts[0] and "Continue the loop" in agent.prompts[1]
     assert archive.best().objective("score") > 1.61
-    assert history.usage(storage)["draft_evals"] == 3
+    (review,) = agent.supervisor_prompts
+    assert "last\n6 attempts" in review and "recent drafts (oldest first): score=" in review
+    assert "+++ workspace" in review
+    assert history.counts(storage)["redirect"] == 1
+    delivered = [str(r.get("directions")) for r in agent.replies] + agent.prompts
+    assert sum("hexagonal" in d for d in delivered) == 1
+    assert agent.replies[-1]["stop"] == "11 evaluations"
+    assert history.usage(storage)["draft_evals"] == 10
+    assert history.usage(storage)["cost_usd"] == pytest.approx(0.06)
+    assert history.individual(storage, commits[0]["id"]).name == "a change"
+
+
+class MeteredAgent(CodingAgent):
+    """Reports its cost as it goes and never finishes on its own: the session commits a tie (a stall,
+    so the supervisor starts) and reports $0.40; the supervisor reports $0.70."""
+
+    def __init__(self, on_cost=None):
+        self.on_cost, self.replies = on_cost, []
+
+    def with_meter(self, on_cost):
+        agent = MeteredAgent(on_cost)
+        agent.replies = self.replies
+        return agent
+
+    async def run(self, directory, prompt, session=None, env=None):
+        if "EVOKIT_COMMIT" in env:
+            main = Path(directory) / "main.py"
+            main.write_text(main.read_text() + "\n")
+            proc = await asyncio.to_thread(subprocess.run, [env["EVOKIT_COMMIT"], "a tie"], capture_output=True, text=True)
+            self.replies.append(json.loads(proc.stdout))
+            await asyncio.sleep(0.2)
+            self.on_cost(0.4)
+        else:
+            self.on_cost(0.7)
+        await asyncio.sleep(600)
+
+
+def test_avo_session_and_supervisor_share_the_budget(tmp_path, monkeypatch):
+    import importlib
+
+    from algorithms import avo
+
+    monkeypatch.setattr(importlib.import_module("evokit.recipes.avo"), "STOP_GRACE", 0.2)
+    agent = MeteredAgent()
+    storage, _ = asyncio.run(avo.run(str(tmp_path / "run"), agent=agent, max_cost=1.0, stall_after=1))
+    assert agent.replies[0]["kept"] and agent.replies[0]["budget_left_usd"] == 1.0
+    notes = {r["note"]: r for r in history.records(storage) if r["kind"] == "note"}
+    assert notes["stop"]["text"] == "$1 spent"
+    assert notes["session"]["usage"]["estimated_cost_usd"] == pytest.approx(0.4)
+    assert notes["supervisor-failed"]["usage"]["estimated_cost_usd"] == pytest.approx(0.7)
+    assert history.usage(storage)["cost_usd"] == pytest.approx(1.1)
 
 
 class FakeMessagesAPI(http.server.BaseHTTPRequestHandler):

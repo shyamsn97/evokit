@@ -28,7 +28,7 @@ evokit = "evokit.interface.cli:main"
 include = ["evokit*"]
 
 [tool.setuptools.package-data]
-evokit = ["templates/task/*"]
+evokit = ["templates/task/*", "skills/evokit/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -177,6 +177,9 @@ evokit evolve --store http://host:8700 ...       # on every worker machine
 
 ### Remote evaluation and mutation: left to the user
 
+(Extended by [sandboxes.md](sandboxes.md): this holds for Python functions; evokit's file-based
+components get a `runtime=` parameter.)
+
 There is no `Pool` or executor abstraction. `Evaluator.evaluate` and
 `Operator.create_individual` are async, so where they run is their own business, and
 `FunctionEvaluator` already accepts async functions:

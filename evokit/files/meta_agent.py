@@ -14,7 +14,7 @@ from evokit.files.tree import Files
 from evokit.operator import Operator
 from evokit.records import Individual, Offspring, Selection
 from evokit.storage import Storage
-from evokit.util import truncate
+from evokit.util import title_and_body, truncate
 
 
 class MetaAgentModify(Operator):
@@ -64,8 +64,9 @@ class MetaAgentModify(Operator):
             shutil.rmtree(root, ignore_errors=True)
         if child == parent.genome:
             raise OperatorError("the meta agent changed nothing", result.usage)
-        info = {"operator": self.name, "summary": truncate(result.summary, 2000)}
-        return Offspring((Individual.new(child, [parent.id], info),), result.usage)
+        name, description = title_and_body(result.summary)
+        child = Individual.new(child, [parent.id], {"operator": self.name}, name=name, description=truncate(description, 2000))
+        return Offspring((child,), result.usage)
 
 
 def write_history(directory: Path, archive, parent_logs: Path, objective: str = "score") -> None:
@@ -77,7 +78,8 @@ def write_history(directory: Path, archive, parent_logs: Path, objective: str = 
                 "id": member.id,
                 "parents": list(member.parents),
                 "score": member.objective(objective),
-                "summary": member.info.get("summary", ""),
+                "name": member.name,
+                "description": member.description,
             }) + "\n")
     if parent_logs.is_dir():
         shutil.copytree(parent_logs, directory / "parent_logs")

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import sys
 from pathlib import Path
 
 import evokit as ek
@@ -27,15 +29,15 @@ def model(name: str | None = None) -> AnthropicModel:
     return AnthropicModel(name, price=PRICES.get(name))
 
 
-def claude_code() -> ClaudeCode:
-    return ClaudeCode(model=os.environ.get("EVOKIT_AGENT_MODEL", "sonnet"), max_turns=40)
+def claude_code(max_turns: int = 40, timeout: str = "1h") -> ClaudeCode:
+    return ClaudeCode(model=os.environ.get("EVOKIT_AGENT_MODEL", "sonnet"), max_turns=max_turns, timeout=timeout)
 
 
 async def seed_archive(storage: ek.Storage, archive: ek.Archive, genome, eval_fn) -> None:
     """A fresh run starts from `genome`; a continued run's archive has restored itself."""
     if archive.members():
         return
-    await ek.tell(storage, archive, await ek.evaluate(storage, [ek.Individual.new(genome)], eval_fn=eval_fn))
+    await ek.tell(storage, archive, await ek.evaluate(storage, [ek.Individual.new(genome, name="seed")], eval_fn=eval_fn))
     if not archive.members():
         feedback = history.evaluated(storage)[-1].evaluation.feedback
         raise SystemExit(f"the seed failed its evaluation:\n{feedback[:2000]}")
@@ -49,6 +51,7 @@ def arguments(description: str, variants=(), **defaults) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=defaults.get("workers", 1))
     parser.add_argument("--max-evaluations", type=int, default=defaults.get("max_evaluations"))
     parser.add_argument("--max-cost", type=float, default=defaults.get("max_cost", 5.0), help="US dollars")
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="evokit: %(message)s")
     return parser.parse_args()
 
 

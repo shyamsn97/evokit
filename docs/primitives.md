@@ -31,6 +31,8 @@ class Individual:
     parents: tuple[str, ...]
     info: dict
     evaluation: Evaluation | None      # set with individual.with_evaluation(...), which returns a copy
+    name: str                          # one line saying what this version is, set by its operator
+    description: str                   # what changed and why
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class Selection:                       # what a strategy picks for one child-to-
 class Offspring:                       # what an operator returns
     children: tuple[Individual, ...]
     usage: dict[str, float]            # what creating them cost
+    logs: Mapping[str, bytes]          # e.g. an agent's transcript; ask stores them in each child's artifacts
 
 
 @dataclass(frozen=True)
@@ -223,7 +226,9 @@ runs/mar5/
   history/records.jsonl      evokit.history: one JSON record per line
   archive/changes.jsonl      the Archive base class: one change per line
   blobs/ab/cdef...           genome encoding: content-addressed, so equal content is stored once
-  artifacts/<id>/            evaluate: each individual's evaluation folder, through storage.local
+  artifacts/<id>/            evaluate: each individual's evaluation folder, through storage.local;
+                             ask: the operator's logs for the child (agent.jsonl: the agent's session)
+  failed/<id>/               ask: the logs of an operator call that failed (its note names the folder)
 ```
 
 Individuals are saved with `encode(individual, storage)` and `decode(data, storage)`. A genome
@@ -406,30 +411,29 @@ functions:
 
 ### AVO
 
-AVO is a single coding-agent session. A supervisor redirects the agent after a run of
-attempts that do not improve.
+AVO is one coding-agent session that commits versions itself. It does not go through `ask`:
+the agent calls `$EVOKIT_COMMIT`, and the recipe records, evaluates and tells each commit at once.
 
 ```python
-# evokit/recipes/avo.py
-REDIRECT = "The last attempts did not improve the score. Step back and try a different direction."
+# evokit/recipes/avo.py, abridged
+async def commit(args):                                   # served to the agent as $EVOKIT_COMMIT
+    if reason := limits.reached(storage):
+        return {"error": "the run is over; stop now", "stop": reason}
+    best = archive.best()
+    child = Individual.new(project.read(workspace), [best.id], {"operator": "avo"}, name=args[0], description=args[1])
+    history.record_created(storage, [child], [best.id])
+    (child,) = await evokit.evaluate(storage, [child], eval_fn=eval_fn)
+    kept = await evokit.tell(storage, archive, [child])
+    return {"id": child.id, "kept": bool(kept), ...}      # plus "directions" from the supervisor, or "stop"
 
-
-async def avo(project, eval_fn, agent, *, storage, archive, max_cost=5.0, redirect_after=5):
-    strategy = Greedy()
-    operator = CodingAgentOperator(agent, project, persistent=True)          # one session for the whole run
-
-    rejected_in_a_row = 0
-    while history.usage(storage)["cost_usd"] < max_cost:
-        asked = await evokit.ask(storage, archive, strategy, operator)
-        evaluated = await evokit.evaluate(storage, asked.individuals, eval_fn=eval_fn)
-        admitted = await evokit.tell(storage, archive, evaluated)
-        rejected_in_a_row = 0 if admitted else rejected_in_a_row + len(evaluated)
-        if rejected_in_a_row >= redirect_after:
-            operator.redirect(REDIRECT)
-            history.note(storage, "redirect", REDIRECT)
-            rejected_in_a_row = 0
-    return archive.best()
+while not limits.reached(storage):                        # one conversation, resumed when it ends
+    result = await agent.with_budget(remaining).run(workspace, prompt, session=session, env=commands)
+    history.note(storage, "session", ..., usage=result.usage)
+    prompt = CONTINUE
 ```
+
+After `stall_after` drafts and commits without a strictly better score, a fresh read-only session of the
+same agent reviews the run and its directions are noted as `redirect` and passed to the agent.
 
 ### OpenEvolve
 
@@ -666,7 +670,8 @@ class MetaAgentModify(Operator):
             child = Files.from_directory(root / "repo")
         if child == parent.genome:
             raise OperatorError("the meta agent changed nothing", usage=result.usage)
-        return Offspring((Individual.new(child, [parent.id], {"operator": self.name, "summary": result.summary}),), result.usage)
+        name, description = title_and_body(result.summary)
+        return Offspring((Individual.new(child, [parent.id], {"operator": self.name}, name=name, description=description),), result.usage)
 
 
 def write_history(directory, archive, parent_logs):
@@ -676,7 +681,7 @@ def write_history(directory, archive, parent_logs):
         for member in archive.members():
             f.write(json.dumps({"id": member.id, "parents": member.parents,
                                 "score": member.evaluation.objectives.get("score"),
-                                "summary": member.info.get("summary", "")}) + "\n")
+                                "name": member.name, "description": member.description}) + "\n")
     if parent_logs.is_dir():
         shutil.copytree(parent_logs, directory / "parent_logs")
 ```

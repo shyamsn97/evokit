@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="430" viewBox="0 0 860 430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#57606a"/>
+    </marker>
+    <style>
+      .n { font-size: 15px; font-weight: 600; fill: #1f2328; }
+      .h { font-size: 13px; font-weight: 600; fill: #1f2328; }
+      .s { font-size: 12.5px; fill: #656d76; }
+      .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; fill: #1f2328; }
+      .a { stroke: #57606a; stroke-width: 1.6; fill: none; }
+      .eng { fill: #ffffff; stroke: #d0d7de; }
+      .exp { fill: #eaeef2; stroke: #d0d7de; }
+    </style>
+  </defs>
+
+  <rect width="860" height="430" fill="#ffffff"/>
+
+  <!-- driver -->
+  <rect x="30.5" y="40.5" width="330" height="350" rx="12" class="exp"/>
+  <text x="195" y="68" text-anchor="middle" class="n">Driver: one process</text>
+  <text x="195" y="88" text-anchor="middle" class="s">keeps the run's state; the only writer</text>
+
+  <rect x="55.5" y="108.5" width="280" height="56" rx="8" class="eng"/>
+  <text x="195" y="131" text-anchor="middle" class="code">ask &#183; evaluate &#183; tell</text>
+  <text x="195" y="151" text-anchor="middle" class="s">N workers (asyncio)</text>
+
+  <rect x="55.5" y="176.5" width="135" height="56" rx="8" class="eng"/>
+  <text x="123" y="200" text-anchor="middle" class="h">strategy</text>
+  <text x="123" y="219" text-anchor="middle" class="h">archive</text>
+
+  <rect x="200.5" y="176.5" width="135" height="56" rx="8" class="eng"/>
+  <text x="268" y="200" text-anchor="middle" class="h">history</text>
+  <text x="268" y="219" text-anchor="middle" class="s">limits, cost</text>
+
+  <rect x="55.5" y="244.5" width="280" height="56" rx="8" class="eng"/>
+  <text x="195" y="267" text-anchor="middle" class="h">Storage</text>
+  <text x="195" y="287" text-anchor="middle" class="s">DirectoryStorage; later S3, a volume</text>
+
+  <rect x="55.5" y="312.5" width="280" height="56" rx="8" class="eng"/>
+  <text x="195" y="335" text-anchor="middle" class="h">LLM calls</text>
+  <text x="195" y="355" text-anchor="middle" class="s">network-bound: stay here</text>
+
+  <!-- arrows -->
+  <path d="M362,175 L478,135" class="a" marker-end="url(#head)"/>
+  <path d="M478,250 L362,215" class="a" marker-end="url(#head)"/>
+  <text x="420" y="140" text-anchor="middle" class="s">genome in</text>
+  <text x="420" y="262" text-anchor="middle" class="s">results back</text>
+  <text x="420" y="200" text-anchor="middle" class="code">runtime=</text>
+
+  <!-- runtime -->
+  <rect x="480.5" y="40.5" width="350" height="350" rx="12" class="exp"/>
+  <text x="655" y="68" text-anchor="middle" class="n">Runtime</text>
+  <text x="655" y="88" text-anchor="middle" class="s">local &#183; Modal &#183; SkyPilot</text>
+
+  <rect x="505.5" y="108.5" width="300" height="80" rx="8" class="eng"/>
+  <text x="655" y="131" text-anchor="middle" class="h">Sandbox</text>
+  <text x="655" y="151" text-anchor="middle" class="code">evaluate.py on the genome</text>
+  <text x="655" y="171" text-anchor="middle" class="s">ScriptEvaluator: metrics, artifacts</text>
+
+  <rect x="505.5" y="200.5" width="300" height="80" rx="8" class="eng"/>
+  <text x="655" y="223" text-anchor="middle" class="h">Sandbox</text>
+  <text x="655" y="243" text-anchor="middle" class="code">claude -p, editing the files</text>
+  <text x="655" y="263" text-anchor="middle" class="s">ClaudeCode: streamed steps, edited genome</text>
+
+  <rect x="505.5" y="292.5" width="300" height="76" rx="8" class="eng"/>
+  <text x="655" y="320" text-anchor="middle" class="h">one per call in flight</text>
+  <text x="655" y="342" text-anchor="middle" class="s">each starts with the task's environment</text>
+  <text x="655" y="359" text-anchor="middle" class="s">never touches the run's storage</text>
+</svg>

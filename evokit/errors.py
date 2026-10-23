@@ -32,13 +32,21 @@ class EnvironmentModified(UsageError):
         )
 
 
-class OperatorError(Exception):
-    """The operator tried and produced nothing, e.g. the LLM's diff didn't apply. `ask` records it with its cost."""
+class RunBusy(UsageError):
+    """Another process holds the run's lock (Storage.lock), e.g. another loop is driving it."""
 
-    def __init__(self, reason: str, usage: dict | None = None):
+    kind = "run_busy"
+
+
+class OperatorError(Exception):
+    """The operator tried and produced nothing, e.g. the LLM's diff didn't apply. `ask` records it with
+    its cost, and stores `logs` (file name -> contents) under failed/<id>/."""
+
+    def __init__(self, reason: str, usage: dict | None = None, logs: dict[str, bytes] | None = None):
         super().__init__(reason)
         self.reason = reason
         self.usage = usage or {}
+        self.logs = logs or {}
 
 
 class DiffError(ValueError):

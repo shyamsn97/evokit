@@ -10,6 +10,7 @@ from evokit import history
 from evokit.archive import Archive
 from evokit.errors import UsageError
 from evokit.interface.commands import command
+from evokit.interface.history import HistoryCommands
 from evokit.loop import EvalFn
 from evokit.operator import Operator
 from evokit.records import Individual
@@ -41,7 +42,7 @@ def _summary(record: dict) -> dict:
 
 
 class RunCommands:
-    """status, select-individuals, evaluate-genome, get/list/best-individual(s), list-events, run."""
+    """status, select-individuals, evaluate-genome, list/best-individual(s), list-events, run; `history` has log, show, diff, grep."""
 
     def __init__(
         self,
@@ -56,16 +57,11 @@ class RunCommands:
     ):
         self.storage, self.archive, self.strategy, self.operator, self.eval_fn = storage, archive, strategy, operator, eval_fn
         self.task, self.extras = task, tuple(extras)
+        self.history = HistoryCommands(storage, archive)
 
     def lookup(self, id: str) -> Individual:
-        """An individual by id: an archive member, else anything in the history."""
-        found = self.archive.get(id)
-        if found is not None:
-            return found
-        try:
-            return history.individual(self.storage, id)
-        except KeyError:
-            raise UsageError(f"no individual {id!r}", hint="list them with `evokit list-individuals`") from None
+        """An individual by id: anything in the history, else an archive member."""
+        return self.history.lookup(id)
 
     def _best(self) -> Individual | None:
         best = getattr(self.archive, "best", None)
@@ -99,15 +95,18 @@ class RunCommands:
         return background.run(self.strategy.select(self.archive, n))
 
     @command
-    def evaluate_genome(self, genome: Any, parents: list[str] | None = None, note: str | None = None) -> Individual:
+    def evaluate_genome(
+        self, genome: Any, parents: list[str] | None = None, name: str = "", description: str = ""
+    ) -> Individual:
         """Make an individual from a genome, evaluate it, and offer it to the archive.
 
-        With no parents it is a seed. The result has its evaluation and info.admitted.
+        With no parents it is a seed. `name` is one line saying what this version is, `description`
+        what changed and why. The result has its evaluation and info.admitted.
         """
         parents = list(parents or [])
         for parent in parents:
             self.lookup(parent)
-        child = Individual.new(genome, parents, {"note": note} if note else None)
+        child = Individual.new(genome, parents, name=name, description=description)
         if parents:
             history.record_created(self.storage, [child], parents)
         return background.run(self._evaluate_and_tell([child]))[0]
@@ -129,11 +128,6 @@ class RunCommands:
         return individual
 
     @command
-    def get_individual(self, individual: Individual) -> Individual:
-        """One individual: its genome, evaluation, parents and info."""
-        return individual
-
-    @command
     def list_individuals(self) -> list[Individual]:
         """The archive's members (best first, for ranked archives)."""
         return self.archive.members()
@@ -150,24 +144,24 @@ class RunCommands:
         return records[-limit:] if limit else records
 
     @command(surfaces=("cli", "tools"))
-    def run(self, workers: int = 1, max_evaluations: int | None = None, max_cost: float | None = None) -> Individual | None:
+    def run(
+        self, workers: int = 1, max_evaluations: int | None = None, max_cost: float | None = None, max_failures: int | None = 10
+    ) -> Individual | None:
         """Run ask, evaluate and tell with the run's operator until a limit is reached or nothing can be selected.
 
-        Limits count the whole run, seeds included. Returns the best individual.
+        Limits count the whole run, seeds included; `max_failures` counts operator failures in a
+        row. The operator is checked first, and only one process at a time can run a run.
+        Returns the best individual.
         """
         if self.operator is None:
             raise UsageError("this run has no operator", hint="you are the operator: use select-individuals and evaluate-directory")
         if not len(self.archive):
             raise UsageError("the archive is empty", hint="a run is seeded with its task's files when it is created")
         eval_fn = self._eval_fn()
-
-        def done() -> bool:
-            return (max_evaluations is not None and history.counts(self.storage)["evaluated"] >= max_evaluations) or (
-                max_cost is not None and history.usage(self.storage)["cost_usd"] >= max_cost
-            )
+        limits = evokit.Limits(max_evaluations, max_cost, max_failures)
 
         async def worker() -> None:
-            while not done():
+            while not limits.reached(self.storage):
                 asked = await evokit.ask(self.storage, self.archive, self.strategy, self.operator)
                 if asked.exhausted:
                     return
@@ -177,6 +171,8 @@ class RunCommands:
         async def go() -> None:
             await asyncio.gather(*(worker() for _ in range(workers)))
 
-        background.run(go())
-        history.note(self.storage, "stop")
+        background.run(self.operator.check())
+        with self.storage.lock("driver"):
+            background.run(go())
+        history.note(self.storage, "stop", limits.reached(self.storage) or "nothing left to select")
         return self._best()

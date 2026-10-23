@@ -37,16 +37,29 @@ class Evaluation:
 
 @dataclass(frozen=True)
 class Individual:
+    """`name` is one line saying what this version is, `description` what changed and why (like a
+    commit's subject and body); the operator that makes it sets them."""
+
     id: str
     genome: Any
     parents: tuple[str, ...] = ()
     info: Mapping[str, Any] = field(default_factory=dict)
     evaluation: Evaluation | None = None
+    name: str = ""
+    description: str = ""
 
     @classmethod
-    def new(cls, genome: Any, parents: Sequence[str] = (), info: Mapping[str, Any] | None = None) -> "Individual":
+    def new(
+        cls,
+        genome: Any,
+        parents: Sequence[str] = (),
+        info: Mapping[str, Any] | None = None,
+        *,
+        name: str = "",
+        description: str = "",
+    ) -> "Individual":
         """A fresh, unevaluated individual."""
-        return cls(new_id(), genome, tuple(parents), dict(info or {}))
+        return cls(new_id(), genome, tuple(parents), dict(info or {}), name=name, description=description)
 
     def with_evaluation(self, evaluation: Evaluation) -> "Individual":
         return replace(self, evaluation=evaluation)
@@ -69,10 +82,12 @@ class Selection:
 
 @dataclass(frozen=True)
 class Offspring:
-    """What an operator returns."""
+    """What an operator returns. `logs` (file name -> contents), e.g. an agent's transcript, are
+    stored in each child's artifact folder."""
 
     children: tuple[Individual, ...]
     usage: dict[str, float] = field(default_factory=dict)
+    logs: Mapping[str, bytes] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

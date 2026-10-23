@@ -12,7 +12,7 @@ import pytest
 import evokit as ek
 from evokit.interface.cli import main
 from evokit.interface.setup import open_setup
-from evokit.interface.skill import export_skill, render_skill
+from evokit.interface.skill import SKILL_FILE, export_skill, render_skill
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,7 +78,7 @@ def test_init_writes_a_task_that_runs_as_it_is(tmp_path):
     assert code == 0 and out["files"] == ["TASK.md", "config.yaml", "evaluate.py", "main.py"]
     code, status, _ = cli("status", "--task", "toy", "--dir", "toy/runs/0", cwd=tmp_path)
     assert code == 0 and status["members"] == 1 and status["best"]["evaluation"]["objectives"] == {"score": -2.0}
-    assert status["best"]["info"] == {"note": "seed"}
+    assert status["best"]["name"] == "seed" and status["best"]["info"] == {}
     code, _, err = cli("init", "toy", cwd=tmp_path)
     assert code == 2 and "not empty" in err["error"]
 
@@ -105,18 +105,34 @@ def test_agent_is_the_operator_cli(task):
     (work / "evaluate.py").write_text((task / "evaluate.py").read_text())
 
     # commands work from any directory: the run records its task folder
-    code, individual, _ = cli("evaluate-directory", str(work), "--parent", seed_id, "--note", "X to 2", "--dir", str(task / ".evokit"), cwd=work)
+    code, individual, _ = cli(
+        "evaluate-directory", str(work), "--parent", seed_id, "--name", "X to 2", "--description", "closer to 3",
+        "--dir", str(task / ".evokit"), cwd=work,
+    )
     assert code == 0 and individual["evaluation"]["objectives"]["score"] == -1.0 and individual["parents"] == [seed_id]
-    assert individual["info"]["admitted"] is True and individual["info"]["note"] == "X to 2"
-    code, diff, _ = cli("diff-individuals", seed_id, individual["id"], cwd=task)
-    assert "+X = 2.0" in diff
-    code, got, _ = cli("get-individual", seed_id, cwd=task)
-    assert code == 0 and got["id"] == seed_id
+    assert individual["info"]["admitted"] is True and individual["name"] == "X to 2"
+
+    # reading the run, like git
+    code, diff, _ = cli("diff", individual["id"], cwd=task)
+    assert code == 0 and "+X = 2.0" in diff and f"--- {seed_id}/main.py" in diff
+    code, got, _ = cli("show", individual["id"], cwd=task)
+    assert code == 0 and got["description"] == "closer to 3" and got["files"] == ["main.py"] and got["member"]
+    code, text, _ = cli("show", individual["id"], "main.py", cwd=task)
+    assert text == "X = 2.0\n"
+    code, log, _ = cli("log", cwd=task)
+    assert [(e["id"], e["name"]) for e in log] == [(individual["id"], "X to 2"), (seed_id, "seed")]
+    (work / "main.py").write_text("X = 0.5\n")
+    code, worse, _ = cli("evaluate-directory", str(work), "--parent", individual["id"], "--name", "try 0.5", cwd=task)
+    assert worse["info"]["admitted"] is False
+    code, log, _ = cli("log", "--all", cwd=task)
+    assert [e["id"] for e in log] == [worse["id"], individual["id"], seed_id] and not log[0]["admitted"]
+    code, found, _ = cli("grep", "X = 0\\.5", cwd=task)
+    assert [f["id"] for f in found] == [worse["id"]] and found[0]["matches"] == [{"path": "main.py", "line": 1, "text": "X = 0.5"}]
 
     code, status, _ = cli("status", cwd=task)
-    assert status["best"]["id"] == individual["id"] and status["counts"]["evaluated"] == 2 and status["counts"]["created"] == 1
+    assert status["best"]["id"] == individual["id"] and status["counts"]["evaluated"] == 3 and status["counts"]["created"] == 2
     code, events, _ = cli("list-events", cwd=task)
-    assert [e["kind"] for e in events] == ["evaluated", "created", "evaluated"] and events[-1]["added"]
+    assert [e["kind"] for e in events] == ["evaluated", "created", "evaluated", "created", "evaluated"] and events[2]["added"]
     code, _, err = cli("run", cwd=task)
     assert code == 2 and "no operator" in err["error"]
 
@@ -137,7 +153,7 @@ def test_factory_component_commands_tools_and_mcp(task):
     directory = task / "new"
     directory.mkdir()
     (directory / "main.py").write_text("X = 2.5\n")
-    code, individual, _ = cli("evaluate-directory", str(directory), "--parent", seed["id"], "--note", "manual", cwd=task)
+    code, individual, _ = cli("evaluate-directory", str(directory), "--parent", seed["id"], "--name", "manual", cwd=task)
     assert code == 0 and individual["parents"] == [seed["id"]] and individual["evaluation"]["objectives"]["score"] == -0.5
     code, members, _ = cli("list-individuals", cwd=task)
     assert [m["evaluation"]["objectives"]["score"] for m in members] == [-0.5, -2.0]
@@ -154,6 +170,7 @@ def test_factory_component_commands_tools_and_mcp(task):
     server = build_server(str(task / ".evokit"))
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert {"evaluate_directory", "checkout_individual", "list_individuals", "select_individuals", "status", "evaluator_describe"} <= names
+    assert {"log", "show", "diff", "grep"} <= names
     assert "edit_individual" not in names and "run" not in names
 
 
@@ -185,24 +202,35 @@ def test_factory_needs_the_run_storage(task):
     assert code == 2 and "storage=storage" in err["hint"]
 
 
+def test_the_shipped_skill_matches_the_commands():
+    assert SKILL_FILE.read_text() == render_skill(None, "claude"), (
+        "regenerate it: evokit skill export --stdout > evokit/skills/evokit/SKILL.md"
+    )
+
+
 def test_skill_export(task, tmp_path):
-    setup = open_setup(task / ".evokit", task)
-    text = render_skill(setup, "claude")
+    text = render_skill(None, "claude")
     assert text.startswith("---\nname: evokit")
     assert "`evokit init NAME`" in text and "--task TASK_DIR" in text
     assert "`evokit select-individuals [--n N]`" in text
-    assert "`evokit checkout-individual INDIVIDUAL_ID DIR`" in text
-    assert "`evokit evaluate-directory DIR [--parent ID ...] [--note NOTE]`" in text
+    assert "`evokit checkout-individual ID DIR`" in text
+    assert "`evokit evaluate-directory DIR [--parent ID ...] [--name NAME] [--description DESCRIPTION]`" in text
     assert "`evokit run [--workers WORKERS] [--max-evaluations MAX_EVALUATIONS]" in text
-    assert "operator: you (the strategy, Greedy, selects individuals)" in text and "archive: BestArchive" in text
-    assert "evolving files: main.py" in text and f"task: `{task}`" in text
-    assert "> Raise X to 3 without passing it." in text
-    path = export_skill(setup, "claude", tmp_path)
-    assert path == tmp_path / ".claude" / "skills" / "evokit" / "SKILL.md"
+    assert "`evokit log [ID] [--all] [--limit LIMIT]`" in text and "`evokit show ID [PATH]`" in text
+    assert "`evokit diff A [B]`" in text and "`evokit grep PATTERN [--limit LIMIT]`" in text
+    assert "You are an operator's agent" in text
+
+    mcp = render_skill(open_setup(task / ".evokit", task), "mcp")
+    assert "operator: you (the strategy, Greedy, selects individuals)" in mcp and "archive: BestArchive" in mcp
+    assert "evolving files: main.py" in mcp and f"task: `{task}`" in mcp
+    assert "> Raise X to 3 without passing it." in mcp
+
+    path = export_skill("claude", tmp_path)
+    assert path == tmp_path / ".claude" / "skills" / "evokit" / "SKILL.md" and path.read_text() == text
     agents = tmp_path / "AGENTS.md"
     agents.write_text("# Project\n")
-    export_skill(setup, "codex", tmp_path)
-    export_skill(setup, "codex", tmp_path)
+    export_skill("codex", tmp_path)
+    export_skill("codex", tmp_path)
     content = agents.read_text()
     assert content.startswith("# Project\n") and content.count("<!-- evokit:begin -->") == 1
 

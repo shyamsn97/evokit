@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 from pathlib import Path
 from typing import Mapping
 
@@ -15,7 +14,7 @@ from evokit.records import Individual
 
 
 class FileCommands:
-    """checkout-individual, evaluate-directory, read-file, diff-individuals (and edit-individual for tools)."""
+    """checkout-individual, evaluate-directory (and edit-individual for tools)."""
 
     def __init__(self, project: Project):
         self.project = project
@@ -40,36 +39,18 @@ class FileCommands:
 
     @command
     def evaluate_directory(
-        self, run: RunCommands, directory: str, parents: list[str] | None = None, note: str | None = None
+        self, run: RunCommands, directory: str, parents: list[str] | None = None, name: str = "", description: str = ""
     ) -> Individual:
         """Make an individual from a directory's genome files, evaluate it, and offer it to the archive.
 
-        The result has its evaluation and info.admitted. Edits to environment files (anything
-        outside the genome) are rejected.
+        `name` is one line saying what this version is, `description` what changed and why. The
+        result has its evaluation and info.admitted. Edits to environment files (anything outside
+        the genome) are rejected.
         """
         path = Path(directory)
         if not path.is_dir():
             raise UsageError(f"not a directory: {path}")
-        return run.evaluate_genome(self.project.read(path), parents, note)
-
-    @command
-    def read_file(self, individual: Individual, path: str) -> str:
-        """The text of one file in an individual's genome."""
-        files = _files(individual)
-        if path not in files:
-            raise UsageError(f"{path} is not in {individual.id}", hint=f"files: {files.paths()}")
-        return files.text(path)
-
-    @command
-    def diff_individuals(self, a: Individual, b: Individual) -> str:
-        """Unified diff between two individuals' genomes."""
-        fa, fb = _files(a), _files(b)
-        out = []
-        for path in sorted(set(fa.paths()) | set(fb.paths())):
-            old = fa.text(path).splitlines(keepends=True) if path in fa else []
-            new = fb.text(path).splitlines(keepends=True) if path in fb else []
-            out.extend(difflib.unified_diff(old, new, f"{a.id}/{path}", f"{b.id}/{path}"))
-        return "".join(out)
+        return run.evaluate_genome(self.project.read(path), parents, name, description)
 
     @command(surfaces=("tools",))
     def edit_individual(

@@ -10,7 +10,7 @@ from evokit.operator import Operator
 from evokit.operators.models import Model
 from evokit.operators.prompts import describe_individual
 from evokit.records import Individual, Offspring, Selection, merge_usage
-from evokit.util import truncate
+from evokit.util import title_and_body, truncate
 
 
 class LLMOperator(Operator):
@@ -25,6 +25,9 @@ class LLMOperator(Operator):
     def __init__(self, model: Model, instructions: str | None = None):
         self.model = model
         self.instructions = instructions
+
+    async def check(self) -> None:
+        await self.model.check()
 
     @abstractmethod
     def build_prompt(self, selection: Selection) -> str: ...
@@ -48,7 +51,12 @@ class LLMOperator(Operator):
         if selection.parents and genome == selection.parents[0].genome:
             raise OperatorError("the model's reply did not change the genome", usage)
         info = {"operator": self.name, "response": truncate(completion.text, 20_000)}
-        return Offspring((Individual.new(genome, [p.id for p in selection.parents], info),), usage)
+        name, description = title_and_body(_PROSE.split(completion.text, 1)[0])
+        child = Individual.new(genome, [p.id for p in selection.parents], info, name=name, description=truncate(description, 2000))
+        return Offspring((child,), usage)
+
+
+_PROSE = re.compile(r"^(?:```|<<<<<<< SEARCH)", re.M)
 
 
 _FENCE = re.compile(r"```[^\n]*\n(.*?)\n```", re.S)

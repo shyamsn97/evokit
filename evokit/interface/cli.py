@@ -19,8 +19,9 @@ from evokit import __version__
 from evokit.errors import EvoError, UsageError
 from evokit.files.commands import FileCommands
 from evokit.interface.commands import Command, component_commands, encode, injected_arguments
+from evokit.interface.history import HistoryCommands
 from evokit.interface.run import RunCommands
-from evokit.interface.setup import Setup, open_setup
+from evokit.interface.setup import Setup, open_history, open_setup
 from evokit.records import Individual
 from evokit.task import init_task
 
@@ -28,7 +29,7 @@ DEFAULT_DIR = os.environ.get("EVOKIT_DIR", ".evokit")
 DEFAULT_TASK = os.environ.get("EVOKIT_TASK")
 FORMATS = ("auto", "json", "text")
 CLI_NAMES = {"parents": "--parent"}
-OWNERS: tuple[type, ...] = (RunCommands, FileCommands)
+OWNERS: tuple[type, ...] = (RunCommands, FileCommands, HistoryCommands)
 _HINTS = {"Individual": Individual, "RunCommands": RunCommands}
 
 
@@ -54,6 +55,10 @@ def hints(fn: Callable) -> dict[str, Any]:
     return typing.get_type_hints(fn, localns=_HINTS)
 
 
+def _is_individual(annotation: Any) -> bool:
+    return _unwrap_optional(annotation) is Individual
+
+
 def _cli_annotation(annotation: Any) -> Any | None:
     """Map a Python API type to something a command line can carry; None means unsupported.
 
@@ -61,6 +66,8 @@ def _cli_annotation(annotation: Any) -> Any | None:
     """
     if annotation is Individual:
         return str
+    if _is_individual(annotation):
+        return str | None
     if annotation is Any or typing.get_origin(annotation) in (dict, typing.Mapping) or "Mapping" in repr(annotation):
         return None
     return annotation
@@ -89,16 +96,15 @@ def cli_params(fn: Callable) -> list[inspect.Parameter] | None:
 
 def resolve_arguments(fn: Callable, setup: Setup, kwargs: dict) -> dict:
     """Inject the RunCommands, and replace individual ids with the Individuals they name."""
-    run = setup.run
     types = hints(fn)
-    injected = injected_arguments(fn, run)
+    injected = injected_arguments(fn, setup.run)
     out = {}
     for name in inspect.signature(fn).parameters:
         if name in injected:
             out[name] = injected[name]
         elif name in kwargs:
             value = kwargs[name]
-            out[name] = run.lookup(value) if types.get(name) is Individual and isinstance(value, str) else value
+            out[name] = setup.history.lookup(value) if _is_individual(types.get(name)) and isinstance(value, str) else value
     return out
 
 
@@ -118,11 +124,23 @@ def _click_type(annotation: Any) -> Any:
     return annotation if annotation in (int, float, str) else str
 
 
-def _click_param(param: inspect.Parameter) -> click.Parameter:
+def positional(fn: Callable, param: inspect.Parameter) -> bool:
+    """Required parameters, individuals (by id), and those the command names are positional."""
+    meta = getattr(fn, "__evokit_command__", None) or {}
+    return (
+        param.default is inspect.Parameter.empty
+        or _is_individual(hints(fn).get(param.name))
+        or param.name in meta.get("positional", ())
+    )
+
+
+def _click_param(param: inspect.Parameter, is_positional: bool = False) -> click.Parameter:
     annotation = _unwrap_optional(param.annotation)
     flag = CLI_NAMES.get(param.name, "--" + param.name.replace("_", "-"))
     if param.default is inspect.Parameter.empty:
         return click.Argument([param.name], type=_click_type(annotation))
+    if is_positional:
+        return click.Argument([param.name], type=_click_type(annotation), required=False, default=param.default)
     if annotation is bool:
         return click.Option([flag, param.name], is_flag=True, default=bool(param.default))
     if typing.get_origin(annotation) is list:
@@ -139,16 +157,24 @@ def _global_options() -> list[click.Option]:
     ]
 
 
-def _make(name: str, doc: str, params: list[inspect.Parameter], call: Callable[[Setup, dict], Any]) -> click.Command:
+def _make(
+    name: str,
+    fn: Callable,
+    params: list[inspect.Parameter],
+    call: Callable[[Setup, dict], Any],
+    opener: Callable[[str, str | None], Setup] = open_setup,
+) -> click.Command:
     def callback(dir: str, task: str | None, format: str, **kwargs):
         for param in params:
             value = kwargs.get(param.name)
             if isinstance(value, tuple):
                 kwargs[param.name] = list(value) if value else param.default
-        emit(call(open_setup(dir, task), kwargs), format)
+        emit(call(opener(dir, task), kwargs), format)
 
+    doc = inspect.getdoc(fn) or ""
+    click_params = [_click_param(p, positional(fn, p)) for p in params]
     summary = doc.splitlines()[0] if doc else ""
-    return click.Command(name, callback=callback, params=[*map(_click_param, params), *_global_options()], help=doc, short_help=summary)
+    return click.Command(name, callback=callback, params=[*click_params, *_global_options()], help=doc, short_help=summary)
 
 
 def owner_of(setup: Setup, cls: type) -> Any:
@@ -183,14 +209,16 @@ def _owner_command(name: str, meta: dict, cls: type, fn: Callable) -> click.Comm
         value = getattr(owner, fn.__name__)(**resolve_arguments(fn, setup, kwargs))
         return meta["result"](owner, value) if meta["result"] else value
 
-    return _make(name, inspect.getdoc(fn) or "", params, call)
+    if cls is HistoryCommands:
+        return _make(name, fn, params, call, lambda dir, task: open_history(dir))
+    return _make(name, fn, params, call)
 
 
 def _component_command(cmd: Command, setup: Setup) -> click.Command | None:
     params = cli_params(cmd.func)
     if params is None:
         return None
-    return _make(cmd.name, cmd.doc, params, lambda _, kwargs: cmd.shape(cmd.func(**resolve_arguments(cmd.func, setup, kwargs))))
+    return _make(cmd.name, cmd.func, params, lambda _, kwargs: cmd.shape(cmd.func(**resolve_arguments(cmd.func, setup, kwargs))))
 
 
 # built-in commands
@@ -243,18 +271,15 @@ def skill():
 @click.argument("target", type=click.Choice(["claude", "cursor", "codex"]), default="claude")
 @click.option("--to", default=".", show_default=True, help="project root to write into")
 @click.option("--stdout", "to_stdout", is_flag=True, help="print instead of writing")
-@_dir_option
-@_task_option
 @_format_option
-def export(target: str, to: str, to_stdout: bool, dir: str, task: str | None, format: str):
-    """Generate SKILL.md (or an AGENTS.md section) teaching an agent to use evokit."""
+def export(target: str, to: str, to_stdout: bool, format: str):
+    """Write the evokit skill (SKILL.md, or an AGENTS.md section for codex) into a project."""
     from evokit.interface.skill import export_skill, render_skill
 
-    setup = try_open(dir, task)
     if to_stdout:
-        sys.stdout.write(render_skill(setup, target))
+        sys.stdout.write(render_skill(None, target))
         return
-    emit({"written": str(export_skill(setup, target, to))}, format)
+    emit({"written": str(export_skill(target, to))}, format)
 
 
 def try_open(directory: str, task: str | None = None) -> Setup | None:

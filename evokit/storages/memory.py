@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from evokit.errors import RunBusy
 from evokit.storage import Storage, check_path
 
 
@@ -16,6 +17,7 @@ class MemoryStorage(Storage):
     def __init__(self):
         self._files: dict[str, bytes] = {}
         self._lock = threading.Lock()
+        self._held: set[str] = set()
 
     def write(self, path: str, data: bytes) -> None:
         self._files[check_path(path)] = bytes(data)
@@ -55,6 +57,18 @@ class MemoryStorage(Storage):
                     self._files[prefix + file.relative_to(folder).as_posix()] = file.read_bytes()
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+
+    @contextmanager
+    def lock(self, name: str) -> Iterator[None]:
+        with self._lock:
+            if name in self._held:
+                raise RunBusy(f"this run's {name} lock is held", hint="one loop at a time drives a run")
+            self._held.add(name)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._held.discard(name)
 
     def __repr__(self) -> str:
         return "MemoryStorage()"

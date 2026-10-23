@@ -272,7 +272,7 @@ through the CLI (or MCP), following the generated skill file.
 
 ```bash
 evokit status --task . --dir runs/x        # creates the run from the task folder
-evokit skill export claude --dir runs/x      # writes the instructions the agent follows
+evokit skill export claude                  # writes the instructions the agent follows
 ```
 
 This is autoresearch's setup expressed in EvoKit: the skill replaces `program.md`,
@@ -370,17 +370,18 @@ per cell; strategies already read archives through `niches()`.
 | `operators.py` | `DiffOperator`, `FileRewriteOperator`: one-shot LLM operators for `Files`. |
 | `agents.py` | `CodingAgent` base, `ClaudeCode` (headless, resumable), `CommandAgent` (any CLI agent). |
 | `coding_agent.py` | `CodingAgentOperator`: workspace, draft evaluations over a local socket, persistent sessions, supervision. |
-| `commands.py` | `FileCommands`: `checkout-individual`, `evaluate-directory`, `read-file`, `diff-individuals`; what an outside agent uses when it is the operator. |
+| `commands.py` | `FileCommands`: `checkout-individual`, `evaluate-directory`; what an outside agent uses when it is the operator. |
 
 ### `interface/`: using EvoKit from a terminal or an agent
 
 | File | What it is for |
 | --- | --- |
 | `commands.py` | The `@command` marker and registry, JSON encoding of results, and `ek.tools(...)` (plain callables for RLMs and scripts). |
-| `setup.py` | Rebuilding a run in a new process from its task folder (`load_task`), recorded in the run at `run/task.json`. |
+| `setup.py` | Rebuilding a run in a new process from its task folder (`load_task`), recorded in the run at `run/task.json`; `open_history` opens any run for reading. |
+| `history.py` | `HistoryCommands`: `log`, `show`, `diff`, `grep`, git-style reading of a run from its storage alone. |
 | `cli.py` | The `evokit` command (click): one subcommand per `@command` method, JSON output, exit codes `0` ok, `1` internal, `2` usage, `3` budget exhausted, `4` done. |
 | `mcp_server.py` | The same commands as MCP tools (`evokit mcp`). |
-| `skill.py` | `evokit skill export claude|cursor|codex`: a `SKILL.md` describing this experiment's commands. |
+| `skill.py` | The evokit `SKILL.md`, generated from the command registry and shipped in `evokit/skills/`; `evokit skill export claude|cursor|codex` installs it. |
 
 ### Examples
 

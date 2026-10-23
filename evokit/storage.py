@@ -20,6 +20,7 @@ from typing import Any
 
 from evokit.errors import UsageError
 from evokit.records import Evaluation, Individual
+from evokit.util import title_and_body
 
 
 class Storage(ABC):
@@ -46,6 +47,11 @@ class Storage(ABC):
     def local(self, path: str) -> AbstractContextManager[Path]:
         """A real folder holding what is stored under `path`, for code that needs one. What is in the
         folder when the block ends is what is stored under `path`."""
+
+    @abstractmethod
+    def lock(self, name: str) -> AbstractContextManager[None]:
+        """Held by one holder at a time, across processes. Raises RunBusy at once if another holder
+        has it; loops take lock("driver") so only one process drives a run."""
 
 
 def check_path(path: str) -> str:
@@ -99,6 +105,8 @@ def decode_genome(data: Any, storage: Storage) -> Any:
 def encode(individual: Individual, storage: Storage) -> dict:
     return {
         "id": individual.id,
+        "name": individual.name,
+        "description": individual.description,
         "genome": encode_genome(individual.genome, storage),
         "parents": list(individual.parents),
         "info": dict(individual.info),
@@ -107,12 +115,19 @@ def encode(individual: Individual, storage: Storage) -> dict:
 
 
 def decode(data: dict, storage: Storage) -> Individual:
+    info = data.get("info") or {}
+    if "name" in data:
+        name, description = data["name"], data.get("description") or ""
+    else:  # written before individuals had names
+        name, description = title_and_body(str(info.get("summary") or info.get("note") or ""))
     return Individual(
         id=data["id"],
         genome=decode_genome(data["genome"], storage),
         parents=tuple(data.get("parents") or ()),
-        info=data.get("info") or {},
+        info=info,
         evaluation=Evaluation.from_dict(data["evaluation"]) if data.get("evaluation") else None,
+        name=name,
+        description=description,
     )
 
 

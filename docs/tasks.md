@@ -29,6 +29,12 @@ evokit select-individuals --dir runs/0
 evokit run --dir runs/0 --max-cost 5           # when config.yaml names an operator
 ```
 
+`evokit run` stops at whichever limit comes first: `--max-evaluations`, `--max-cost` (US dollars),
+or `--max-failures` (operator calls that failed in a row, default 10, so a broken agent or a bad
+API key stops the run instead of spinning). Before the first step it makes one small call to the
+operator's model or agent, so a setup error fails at once. One process drives a run at a time; a
+second `evokit run` on the same directory exits with `run_busy`.
+
 If the seed fails its evaluation, the command exits with a usage error that includes the
 evaluator's feedback, and nothing is recorded. Fix the files and run the command again. A run
 belongs to one task: passing a different `--task` for an existing run directory is an error.
@@ -122,24 +128,30 @@ default is `task.eval_fn`), and any other objects whose `@command` methods becom
 - **Rejection.** A non-zero exit is a failed evaluation, with no objectives. stderr (or stdout) is
   the feedback. A failed individual is recorded but never admitted.
 - **Artifacts.** `$EVOKIT_WORKDIR` is the individual's artifact folder; files written there are
-  kept at `artifacts/<id>/` in the run.
+  kept at `artifacts/<id>/` in the run. A coding agent's session is kept there too, as
+  `agent.jsonl`.
 - **Time.** `task.timeout` bounds it. A timeout is a failed evaluation.
 
 ## An individual
 
-`evokit get-individual ID` (and every command that returns individuals) prints:
+Every command that returns individuals (`best-individual`, `list-individuals`,
+`evaluate-directory`) prints:
 
 ```json
 {
   "id": "c31fdf401d",
+  "name": "X to 2.9",
+  "description": "solve() now returns 2.9, closer to the target",
   "genome": {"files": ["main.py"], "digest": "db3cfd22..."},
   "parents": ["82f2e18f16"],
   "evaluation": {"objectives": {"score": -0.1}, "feedback": "solve() returned 2.9; the target is 3.0", "usage": {}},
-  "info": {"note": "X to 2.9", "admitted": true}
+  "info": {"admitted": true}
 }
 ```
 
-`genome` lists the files, not their contents: read them with `evokit read-file ID PATH`, write
-them out with `evokit checkout-individual ID DIR`, and compare two with `evokit diff-individuals A B`.
+`genome` lists the files, not their contents. Read a run like a git repository (see
+[reading-runs.md](reading-runs.md)): `evokit log [ID] [--all]` for the lineage, `evokit show ID
+[PATH]` for one individual or one of its files, `evokit diff A [B]` for what changed, and `evokit
+grep PATTERN` to find what was tried. `evokit checkout-individual ID DIR` writes one out.
 `evaluation` is `null` until the individual is evaluated, and has no objectives if it failed.
 `info.admitted` says whether the archive kept it.

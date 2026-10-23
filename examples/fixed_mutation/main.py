@@ -59,7 +59,7 @@ async def main(evaluations: int = 5000) -> None:
     )
     strategy = Greedy()
 
-    await ek.tell(storage, archive, await ek.evaluate(storage, [ek.Individual.new(seed)], eval_fn=eval_fn))
+    await ek.tell(storage, archive, await ek.evaluate(storage, [ek.Individual.new(seed, name="seed")], eval_fn=eval_fn))
     while history.counts(storage)["evaluated"] < evaluations:
         asked = await ek.ask(storage, archive, strategy, operator)
         await ek.tell(storage, archive, await ek.evaluate(storage, asked.individuals, eval_fn=eval_fn))

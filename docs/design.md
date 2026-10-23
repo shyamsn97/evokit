@@ -42,7 +42,7 @@ evokit/
                   tree.py Files    project.py Project    diff.py apply_diff, apply_rewrite
                   evaluator.py ScriptEvaluator    operators.py DiffOperator, FileRewriteOperator
                   coding_agent.py CodingAgentOperator    agents.py CodingAgent, ClaudeCode, CommandAgent
-                  commands.py FileCommands
+                  repl_agent.py ReplAgent    commands.py FileCommands
   interface/      optional: commands.py (@command registry, tools)  factory.py  cli.py  mcp_server.py  skill.py
 ```
 
@@ -173,9 +173,10 @@ Experiment(evaluator, archive, seeds=(), budget=Budget(), store=None, descriptio
 
 experiment.start(allow_failed_seeds=False)   # evaluate and add the seeds, unless the store already has an experiment
 experiment.evaluate_individual(individual) -> Individual   # evaluator, charge the budget, store it
-experiment.evaluate_genome(genome, parents=None, note=None) -> Individual
+experiment.evaluate_genome(genome, parents=None, name="", description="") -> Individual
 experiment.add_individual(individual) -> bool              # archive.add, checkpoint, log
-experiment.get_individual(id) / list_individuals() / best_individual() / list_events(limit) / status()
+experiment.list_individuals() / best_individual() / list_events(limit) / status()
+experiment.history.log(individual=None, all=False) / show(individual, path=None) / diff(a, b=None) / grep(pattern)
 experiment.transaction(components, reload=None)            # lock, load state, save state
 ```
 
@@ -222,9 +223,12 @@ different loop (islands, steady state).
   persistent_session=False, supervisor=None, instructions=None)`: writes the selected
   individual's project into a workspace, runs the agent there, and reads the genome back.
   With an evaluator, the agent can score drafts through `$EVOKIT_DRAFT_EVAL`. Agents:
-  `ClaudeCode` (headless `claude -p`, `--resume` for sessions) and `CommandAgent(argv)`.
-- `FileCommands(project)`: `checkout_individual`, `evaluate_directory`, `read_file`,
-  `diff_individuals` (and `edit_individual` for Python tools).
+  `ClaudeCode` (headless `claude -p`, `--resume` for sessions), `CommandAgent(argv)`, and
+  `ReplAgent(model)`: any `Model` (e.g. `OpenAIModel` for an OpenAI-compatible endpoint) writes
+  ```repl Python blocks that run in a persistent Python process in the workspace, and sees their
+  output; a reply without a block ends the run. Its cost is exact, from each model call.
+- `FileCommands(project)`: `checkout_individual`, `evaluate_directory` (and `edit_individual`
+  for Python tools).
 
 ## interface/: CLI, MCP, skill, tools
 
@@ -233,7 +237,8 @@ with `@command`. One registry reads their signatures and docstrings and produces
 
 1. CLI subcommands (`click`), named after the method (`add_individual` becomes `add-individual`);
 2. MCP tools (`evokit mcp`, requires the `mcp` extra);
-3. a `SKILL.md` (`evokit skill export`), listing only the commands this experiment has;
+3. a `SKILL.md`, generated once and shipped as `evokit/skills/evokit/SKILL.md`
+   (`evokit skill export` copies it into a project; coding agents get it in their workspace);
 4. `evokit.tools(*objects)`: plain synchronous callables for REPL drivers.
 
 Parameters typed `Individual` take an id on the CLI and over MCP. Parameters typed
@@ -249,10 +254,10 @@ working directory. If the experiment uses the default `MemoryStore`, it gets a
 
 ```text
 evokit init MODULE:BUILD [--allow-failed-seeds]
-evokit status | best-individual | list-individuals | get-individual ID | list-events
+evokit status | best-individual | list-individuals | list-events
+evokit log [ID] [--all] | show ID [PATH] | diff A [B] | grep PATTERN   # any run directory
 evokit select-individuals [--n N] | evolve [--steps N]           # with an Engine
-evokit checkout-individual ID DIR | evaluate-directory DIR [--parent ID ...] [--note TEXT]
-evokit read-file ID PATH | diff-individuals A B                   # with FileCommands
+evokit checkout-individual ID DIR | evaluate-directory DIR [--parent ID ...] [--name TEXT] [--description TEXT]
 evokit add-individual ID
 evokit mcp | skill export [claude|cursor|codex] [--stdout]
 ```
@@ -270,9 +275,9 @@ skill replaces `program.md`, admission replaces keep-or-reset, and the event log
 `results.tsv`.
 
 **AVO.** An evaluator that fails incorrect kernels, `BestArchive(objective="tflops",
-ties="accept")`, `Greedy()`, and `CodingAgentOperator(ClaudeCode(model="opus"), project,
-evaluator=..., persistent_session=True, max_draft_evals=50,
-supervisor=StagnationSupervisor(patience=5))`.
+ties="accept")`, and `recipes.avo(project, eval_fn, ClaudeCode(model="opus"), ...)`: one
+continuous session that drafts with `$EVOKIT_DRAFT_EVAL` and commits with `$EVOKIT_COMMIT`
+([avo.md](avo.md)).
 
 **An RLM as the whole algorithm.** `custom_tools=evokit.tools(experiment)`; the RLM calls
 `list_individuals()`, `evaluate_genome()`, `add_individual()`, `status()` and writes

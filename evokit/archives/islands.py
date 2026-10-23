@@ -95,7 +95,9 @@ class IslandArchive(RankedArchive):
     def _copy_to(self, individual: Individual, island: int) -> None:
         if any(m.genome == individual.genome for m in self.island_members(island)):
             return
-        copy = Individual.new(individual.genome, [individual.id], {"operator": "migration", "island": island})
+        copy = Individual.new(
+            individual.genome, [individual.id], {"operator": "migration", "island": island}, name=f"copy of {individual.id} on island {island}"
+        )
         self._place(copy.with_evaluation(individual.evaluation), island)
 
     def add(self, individual: Individual) -> bool:

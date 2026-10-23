@@ -10,7 +10,7 @@ import evokit
 from evokit import history
 from evokit.archive import Archive
 from evokit.files import Files, SelfModify
-from evokit.loop import EvalFn, call_eval_fn
+from evokit.loop import EvalFn, Limits, call_eval_fn
 from evokit.operator import Operator
 from evokit.records import Evaluation, Individual
 from evokit.storage import Storage
@@ -29,6 +29,7 @@ async def dgm(
     workers: int = 4,
     max_children: int = 80,
     max_cost: float | None = None,
+    max_failures: int | None = 10,
     sharpness: float = 10.0,
     midpoint: float = 0.5,
     open_ended: bool = True,
@@ -48,16 +49,24 @@ async def dgm(
     strategy = ProportionalSelection(sharpness, midpoint, objective=objective) if open_ended else Greedy()
     operator = operator or SelfModify(storage, fixed_agent=fixed_agent, instructions=instructions, objective=objective)
 
+    limits = Limits(max_cost=max_cost, max_failures=max_failures)
+
+    def stop_reason() -> str | None:
+        if history.counts(storage)["created"] >= max_children:
+            return f"{max_children} children"
+        return limits.reached(storage)
+
     async def worker() -> None:
-        while history.counts(storage)["created"] < max_children and (
-            max_cost is None or history.usage(storage)["cost_usd"] < max_cost
-        ):
+        while not stop_reason():
             asked = await evokit.ask(storage, archive, strategy, operator)
             if asked.exhausted:
                 return
             await evokit.tell(storage, archive, await evokit.evaluate(storage, asked.individuals, eval_fn=eval_fn))
 
-    await asyncio.gather(*(worker() for _ in range(workers)))
+    await operator.check()
+    with storage.lock("driver"):
+        await asyncio.gather(*(worker() for _ in range(workers)))
+    history.note(storage, "stop", stop_reason() or "nothing left to select")
     return archive.best()
 
 

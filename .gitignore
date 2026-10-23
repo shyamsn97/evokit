@@ -56,3 +56,6 @@ mlruns/*
 */**/gradio_cached_examples/*
 
 .DS_Store
+
+# evokit run directories (examples/*/runs/...)
+runs/

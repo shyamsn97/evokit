@@ -13,7 +13,7 @@ from evokit import history
 from evokit.archives import IslandArchive
 from evokit.archives.islands import genome_text
 from evokit.files import DiffOperator, FileRewriteOperator, Project
-from evokit.loop import EvalFn
+from evokit.loop import EvalFn, Limits
 from evokit.operators import Model
 from evokit.operators.prompts import describe_individual
 from evokit.records import Individual, Selection
@@ -66,6 +66,7 @@ async def shinka(
     every: int = 10,
     max_cost: float = 10.0,
     max_evaluations: int = 150,
+    max_failures: int | None = 10,
     seed: int | None = None,
 ) -> Individual | None:
     """Each attempt picks an edit kind (diff, full rewrite, crossover) and a model (UCB1 over
@@ -81,6 +82,7 @@ async def shinka(
     bandit = ModelBandit(models, objective=objective, seed=seed).fit(storage)
     rng = random.Random(seed)
     notes = history.last_note(storage, "meta") or ""
+    limits = Limits(max_evaluations, max_cost, max_failures)
 
     def parent_of(child: Individual) -> Individual | None:
         if not child.parents:
@@ -95,7 +97,7 @@ async def shinka(
 
     async def worker() -> None:
         nonlocal notes
-        while history.usage(storage)["cost_usd"] < max_cost and history.counts(storage)["evaluated"] < max_evaluations:
+        while not limits.reached(storage):
             kind = rng.choices(list(KINDS), list(KINDS.values()))[0]
             name = bandit.choose()
             prompt = instructions + (f"\n\nWhat has worked so far:\n{notes}" if notes else "")
@@ -123,7 +125,11 @@ async def shinka(
                 notes = reply.text
                 history.note(storage, "meta", notes, reply.usage)
 
-    await asyncio.gather(*(worker() for _ in range(workers)))
+    for model in {id(m): m for m in (*models.values(), judge, summarizer)}.values():
+        await model.check()
+    with storage.lock("driver"):
+        await asyncio.gather(*(worker() for _ in range(workers)))
+    history.note(storage, "stop", limits.reached(storage) or "nothing left to select")
     return archive.best()
 
 

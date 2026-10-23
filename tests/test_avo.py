@@ -26,21 +26,21 @@ def test_persistent_session_drafts_and_redirect(seed, tmp_path, fake_agent):
     first = asyncio.run(operator.create(ek.Selection((parent,)), archive))
     (child,) = first.children
     assert child.genome.text("main.py") == "X = 1.5\n" and child.parents == (parent.id,)
-    assert "draft={'score': -1.5}" in child.info["summary"] and "resumed=;" not in child.info["summary"]
+    assert "draft={'score': -1.5}" in child.name and "resumed=;" not in child.name
     assert first.usage["draft_evals"] == 1 and first.usage["cost_usd"] == pytest.approx(0.01)
     assert operator.session == "sess-1"
 
     operator.redirect("Step back and try something else.")
     (second,) = asyncio.run(operator.create(ek.Selection((child,)), archive)).children
-    assert "redirect=True" in second.info["summary"] and "resumed=sess-1" in second.info["summary"]
+    assert "redirect=True" in second.name and "resumed=sess-1" in second.name
     assert second.info["redirect"] == "Step back and try something else."
 
     (third,) = asyncio.run(operator.create(ek.Selection((second,)), archive)).children
-    assert "redirect=False" in third.info["summary"] and "redirect" not in third.info
+    assert "redirect=False" in third.name and "redirect" not in third.info
 
     resumed = CodingAgentOperator(operator.agent, operator.project, persistent=True, session="sess-1")
     (fourth,) = asyncio.run(resumed.create(ek.Selection((third,)), archive)).children
-    assert "resumed=sess-1" in fourth.info["summary"]
+    assert "resumed=sess-1" in fourth.name
 
 
 def test_persistent_session_serves_one_worker(seed, tmp_path, fake_agent):

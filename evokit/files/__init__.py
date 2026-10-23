@@ -8,6 +8,7 @@ from evokit.files.evaluator import ScriptEvaluator, code_lines, parse_metrics, w
 from evokit.files.meta_agent import MetaAgentModify, write_history
 from evokit.files.operators import DiffOperator, FileRewriteOperator
 from evokit.files.project import DEFAULT_PROTECTED, Project
+from evokit.files.repl_agent import ReplAgent
 from evokit.files.self_modify import SelfModify, script_agent
 from evokit.files.tree import DEFAULT_IGNORE, Files
 
@@ -25,6 +26,7 @@ __all__ = [
     "Files",
     "MetaAgentModify",
     "Project",
+    "ReplAgent",
     "ScriptEvaluator",
     "SelfModify",
     "apply_diff",

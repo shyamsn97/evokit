@@ -21,10 +21,14 @@ class Choice(Operator):
         self.weights = {k: float((weights or {}).get(k, 1.0)) for k in self.operators}
         self._rng = random.Random(seed)
 
+    async def check(self) -> None:
+        for operator in self.operators.values():
+            await operator.check()
+
     async def create(self, selection: Selection, archive) -> Offspring:
         name = self._rng.choices(list(self.weights), weights=list(self.weights.values()))[0]
         try:
             offspring = await self.operators[name].create(selection, archive)
         except OperatorError as exc:
             raise OperatorError(f"[{name}] {exc.reason}", exc.usage) from exc
-        return Offspring(tuple(c.with_info(operator=name) for c in offspring.children), offspring.usage)
+        return Offspring(tuple(c.with_info(operator=name) for c in offspring.children), offspring.usage, offspring.logs)

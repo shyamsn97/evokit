@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from evokit.errors import UsageError
+
 
 @dataclass(frozen=True)
 class Completion:
@@ -23,11 +25,30 @@ class Model(ABC):
     @abstractmethod
     async def generate(self, prompt: str) -> Completion: ...
 
+    async def chat(self, messages: list[dict[str, str]]) -> Completion:
+        """The next assistant message of a conversation in OpenAI's format ({"role", "content"}).
+        By default, the conversation joined into one prompt for `generate`."""
+        return await self.generate("\n\n".join(f"[{m['role']}]\n{m['content']}" for m in messages))
 
-def _cost(price: tuple[float, float] | None, tokens_in: int, tokens_out: int) -> dict[str, float]:
+    async def check(self) -> None:
+        """Raise UsageError if the model cannot answer. A no-op by default."""
+
+
+async def _ask_ok(model: "OpenAIModel | AnthropicModel") -> None:
+    """One tiny request with the model's own settings; its cost is not recorded."""
+    try:
+        await model.generate("Reply with OK.")
+    except Exception as exc:
+        raise UsageError(f"{model.model} cannot answer: {exc}", hint=f"check ${model.api_key_env} and the model name") from None
+
+
+def _cost(price: tuple[float, float] | None, tokens_in: int, tokens_out: int, reported: Any = None) -> dict[str, float]:
+    """`reported` is a cost the endpoint returned itself (OpenRouter's `usage.cost`), used if there is no `price`."""
     usage: dict[str, float] = {"tokens": tokens_in + tokens_out, "input_tokens": tokens_in, "output_tokens": tokens_out}
     if price:
         usage["cost_usd"] = (tokens_in * price[0] + tokens_out * price[1]) / 1_000_000
+    elif isinstance(reported, (int, float)) and not isinstance(reported, bool):
+        usage["cost_usd"] = float(reported)
     return usage
 
 
@@ -56,8 +77,15 @@ class OpenAIModel(Model):
         self.model, self.base_url, self.api_key_env = model, base_url.rstrip("/"), api_key_env
         self.price, self.system, self.timeout, self.params = price, system, timeout, params
 
+    async def check(self) -> None:
+        await _ask_ok(self)
+
     async def generate(self, prompt: str) -> Completion:
-        messages = ([{"role": "system", "content": self.system}] if self.system else []) + [{"role": "user", "content": prompt}]
+        return await self.chat([{"role": "user", "content": prompt}])
+
+    async def chat(self, messages: list[dict[str, str]]) -> Completion:
+        if self.system and not any(m["role"] == "system" for m in messages):
+            messages = [{"role": "system", "content": self.system}, *messages]
         headers = {"authorization": f"Bearer {os.environ.get(self.api_key_env, '')}"}
         data = await asyncio.to_thread(
             _post, f"{self.base_url}/chat/completions", headers, {"model": self.model, "messages": messages, **self.params}, self.timeout
@@ -65,7 +93,7 @@ class OpenAIModel(Model):
         usage = data.get("usage") or {}
         return Completion(
             data["choices"][0]["message"]["content"] or "",
-            _cost(self.price, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)),
+            _cost(self.price, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("cost")),
         )
 
 
@@ -85,10 +113,18 @@ class AnthropicModel(Model):
         self.model, self.api_key_env, self.max_tokens = model, api_key_env, max_tokens
         self.price, self.system, self.timeout, self.base_url = price, system, timeout, base_url.rstrip("/")
 
+    async def check(self) -> None:
+        await _ask_ok(self)
+
     async def generate(self, prompt: str) -> Completion:
-        body: dict[str, Any] = {"model": self.model, "max_tokens": self.max_tokens, "messages": [{"role": "user", "content": prompt}]}
-        if self.system:
-            body["system"] = self.system
+        return await self.chat([{"role": "user", "content": prompt}])
+
+    async def chat(self, messages: list[dict[str, str]]) -> Completion:
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system") or self.system
+        turns = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]
+        body: dict[str, Any] = {"model": self.model, "max_tokens": self.max_tokens, "messages": turns}
+        if system:
+            body["system"] = system
         headers = {"x-api-key": os.environ.get(self.api_key_env, ""), "anthropic-version": "2023-06-01"}
         data = await asyncio.to_thread(_post, f"{self.base_url}/v1/messages", headers, body, self.timeout)
         text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")

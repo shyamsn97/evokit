@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from evokit.errors import RunBusy
 from evokit.storage import Storage, check_path
 
 
@@ -77,6 +78,26 @@ class DirectoryStorage(Storage):
         folder = self._path(path)
         folder.mkdir(parents=True, exist_ok=True)
         yield folder
+
+    @contextmanager
+    def lock(self, name: str) -> Iterator[None]:
+        path = self._path(f"run/{name}.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = os.read(fd, 100).decode(errors="replace").strip() or "another process"
+            os.close(fd)
+            raise RunBusy(f"this run is being driven by {holder}", hint=f"wait for it, or stop it; the lock is {path}") from None
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid {os.getpid()}".encode())
+        try:
+            yield
+        finally:
+            os.ftruncate(fd, 0)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def __repr__(self) -> str:
         return f"DirectoryStorage({str(self.root)!r})"

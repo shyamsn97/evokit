@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -13,6 +14,8 @@ from evokit.util import glob_match, truncate
 DEFAULT_IGNORE = (
     ".git/**",
     ".evokit/**",
+    ".claude/**",
+    ".cursor/**",
     "**/__pycache__/**",
     "**/*.pyc",
     ".venv/**",
@@ -105,6 +108,15 @@ class Files:
         """Every file as a markdown section with a fenced block, for prompts."""
         out = [f"### {path}\n```\n{truncate(self.text(path), max_chars)}\n```" for path in self._files]
         return "\n\n".join(out) or "(empty: no files yet)"
+
+    def diff(self, other: "Files", a: str = "a", b: str = "b") -> str:
+        """A unified diff from this value to `other`, one section per changed file."""
+        out = []
+        for path in sorted(set(self.paths()) | set(other.paths())):
+            old = self.text(path).splitlines(keepends=True) if path in self else []
+            new = other.text(path).splitlines(keepends=True) if path in other else []
+            out.extend(difflib.unified_diff(old, new, f"{a}/{path}", f"{b}/{path}"))
+        return "".join(out)
 
     def describe(self) -> dict:
         """A short JSON summary (for command output); the contents are in the store."""

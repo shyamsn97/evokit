@@ -9,7 +9,7 @@ import evokit
 from evokit import history
 from evokit.archives import IslandArchive
 from evokit.files import DiffOperator, Project
-from evokit.loop import EvalFn
+from evokit.loop import EvalFn, Limits
 from evokit.operators import Choice, Model
 from evokit.records import Individual
 from evokit.storage import Storage
@@ -31,6 +31,7 @@ async def openevolve(
     workers: int = 4,
     max_evaluations: int = 1000,
     max_cost: float | None = None,
+    max_failures: int | None = 10,
     seed: int | None = None,
 ) -> Individual | None:
     """`models` maps a name to a model, picked by `weights` (e.g. {"fast": 0.8, "strong": 0.2}).
@@ -47,13 +48,10 @@ async def openevolve(
         seed=seed,
     )
 
-    def done() -> bool:
-        return history.counts(storage)["evaluated"] >= max_evaluations or (
-            max_cost is not None and history.usage(storage)["cost_usd"] >= max_cost
-        )
+    limits = Limits(max_evaluations, max_cost, max_failures)
 
     async def worker() -> None:
-        while not done():
+        while not limits.reached(storage):
             asked = await evokit.ask(storage, archive, strategy, operator)
             if asked.exhausted:
                 return
@@ -63,5 +61,8 @@ async def openevolve(
             if before // migrate_every < history.counts(storage)["evaluated"] // migrate_every:
                 archive.migrate(top=migrate_top)
 
-    await asyncio.gather(*(worker() for _ in range(workers)))
+    await operator.check()
+    with storage.lock("driver"):
+        await asyncio.gather(*(worker() for _ in range(workers)))
+    history.note(storage, "stop", limits.reached(storage) or "nothing left to select")
     return archive.best()

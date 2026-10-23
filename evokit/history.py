@@ -7,6 +7,7 @@ log on first use, so checking a budget every iteration doesn't re-read the log.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import weakref
@@ -16,6 +17,9 @@ from typing import Iterable
 
 from evokit.records import Individual, merge_usage
 from evokit.storage import Storage, append_json, decode, encode, read_json_lines
+from evokit.util import truncate
+
+log = logging.getLogger("evokit")
 
 LOG = "history/records.jsonl"
 
@@ -30,6 +34,7 @@ class _State:
     pending: dict[str, None] = field(default_factory=dict)       # insertion-ordered set
     claimed: set[str] = field(default_factory=set)               # pending, but handed out by this process
     notes: dict[str, str] = field(default_factory=dict)          # the last text of each note kind
+    failures_in_a_row: int = 0                                   # "failed" notes since the last creation
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -56,6 +61,7 @@ def _apply(state: _State, record: dict, storage: Storage) -> None:
             state.individuals[child.id] = child
             state.pending[child.id] = None
         state.counts["created"] += len(record["children"])
+        state.failures_in_a_row = 0
     elif kind == "evaluated":
         individual = decode(record["individual"], storage)
         state.individuals[individual.id] = individual
@@ -73,6 +79,8 @@ def _apply(state: _State, record: dict, storage: Storage) -> None:
     elif kind == "note":
         state.notes[record["note"]] = record.get("text", "")
         state.counts[record["note"]] += 1
+        if record["note"] == "failed":
+            state.failures_in_a_row += 1
 
 
 def _write(storage: Storage, record: dict) -> None:
@@ -115,6 +123,8 @@ def claim_pending(storage: Storage, n: int) -> list[Individual]:
 
 def note(storage: Storage, kind: str, text: str = "", usage=None) -> None:
     """Anything else worth keeping: a failed operator call, a redirect, a summary, an LLM judge's cost."""
+    if text:
+        log.info("%s: %s", kind, truncate(text, 500))
     _write(storage, {"kind": "note", "note": kind, "text": text, "usage": merge_usage(usage)})
 
 
@@ -157,6 +167,11 @@ def pending(storage: Storage) -> list[Individual]:
 def individual(storage: Storage, id: str) -> Individual:
     """Raises KeyError if the history has no such individual."""
     return _state(storage).individuals[id]
+
+
+def failures_in_a_row(storage: Storage) -> int:
+    """Operator failures ("failed" notes) since the last child was created."""
+    return _state(storage).failures_in_a_row
 
 
 def last_note(storage: Storage, kind: str) -> str | None:

@@ -16,7 +16,7 @@ from evokit.files.project import Project
 from evokit.files.tree import Files
 from evokit.loop import call_eval_fn
 from evokit.records import Evaluation, Individual
-from evokit.util import parse_duration, truncate
+from evokit.util import parse_duration, reaped, spawned, truncate
 
 FEEDBACK_LIMIT = 4000
 
@@ -91,6 +91,7 @@ class ScriptEvaluator:
             )
         except OSError as exc:
             return Evaluation(feedback=f"could not start {self.argv[0]!r}: {exc}")
+        spawned(proc)
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), self.timeout)
         except asyncio.TimeoutError:
@@ -100,6 +101,8 @@ class ScriptEvaluator:
         except asyncio.CancelledError:
             _kill(proc)
             raise
+        finally:
+            reaped(proc)
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
         metrics = parse_metrics(stdout)

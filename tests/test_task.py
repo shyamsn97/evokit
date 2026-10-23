@@ -35,7 +35,7 @@ def test_load_task(task_dir):
     assert isinstance(task.eval_fn, ScriptEvaluator) and task.eval_fn.timeout == 60
     assert sorted(task.project.environment.iterdir()) == sorted(task.project.environment / f for f in ("TASK.md", "config.yaml", "data.txt", "evaluate.py"))
     seed = task.seed()
-    assert seed.genome.paths() == ["main.py"] and seed.info == {"note": "seed"} and seed.evaluation is None
+    assert seed.genome.paths() == ["main.py"] and seed.name == "seed" and seed.info == {} and seed.evaluation is None
     assert not task.project.is_genome("config.yaml") and not task.project.is_genome("TASK.md")
 
 
@@ -43,7 +43,7 @@ def test_open_seeds_a_new_storage_and_continues_an_existing_one(task_dir):
     storage = MemoryStorage()
     run = ek.load_task(task_dir).open(storage)
     (seed,) = run.archive.members()
-    assert seed.objective("score") == -2.0 and seed.info["note"] == "seed"
+    assert seed.objective("score") == -2.0 and seed.name == "seed"
     assert json.loads(storage.read("run/task.json")) == {"task": str(task_dir)}
     again = ek.load_task(task_dir).open(storage)
     assert again.archive.members() == [seed] and history.counts(storage)["evaluated"] == 1
