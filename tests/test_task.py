@@ -1,16 +1,25 @@
 """Task folders: load_task, the run section, and opening (seeding or continuing) a run."""
 
+import functools
 import json
 
 import pytest
 
 import evokit as ek
-from evokit import history
+from evokit.history import History
+from evokit.agents import CodingAgentOperator
 from evokit.archives import PopulationArchive
-from evokit.files import CodingAgentOperator, DiffOperator, ScriptEvaluator
+from evokit.files import DiffOperator, ScriptEvaluator
 from evokit.storages import DirectoryStorage, MemoryStorage
 from evokit.strategies import Tournament
 from evokit.task import TEMPLATE, init_task, open_run
+
+
+@functools.cache
+def history_of(storage) -> History:
+    """One History per storage, as a process keeps one per run."""
+    return History(storage)
+
 
 CONFIG = """
 task:
@@ -46,7 +55,7 @@ def test_open_seeds_a_new_storage_and_continues_an_existing_one(task_dir):
     assert seed.objective("score") == -2.0 and seed.name == "seed"
     assert json.loads(storage.read("run/task.json")) == {"task": str(task_dir)}
     again = ek.load_task(task_dir).open(storage)
-    assert again.archive.members() == [seed] and history.counts(storage)["evaluated"] == 1
+    assert again.archive.members() == [seed] and history_of(storage).counts()["evaluated"] == 1
 
 
 def test_a_failing_seed_records_nothing(task_dir):
@@ -54,7 +63,7 @@ def test_a_failing_seed_records_nothing(task_dir):
     storage = MemoryStorage()
     with pytest.raises(ek.UsageError, match="above 3"):
         ek.load_task(task_dir).open(storage)
-    assert not storage.exists("run/task.json") and history.counts(storage)["evaluated"] == 0
+    assert not storage.exists("run/task.json") and history_of(storage).counts()["evaluated"] == 0
 
 
 def test_run_table_names_the_components(task_dir):
@@ -76,7 +85,7 @@ run:
     (task_dir / "config.yaml").write_text(CONFIG + "run:\n  operator: coding-agent\n  agent: my-agent --fast\n  operator_options: {max_draft_evals: 2}\n")
     _, _, operator = ek.load_task(task_dir).components(MemoryStorage())
     assert isinstance(operator, CodingAgentOperator) and operator.agent.argv == ["my-agent", "--fast"]
-    assert operator.draft_evaluate is not None
+    assert operator.eval_fn is not None and operator.history is not None
 
     (task_dir / "config.yaml").write_text(CONFIG + "run:\n  archive: nope\n")
     with pytest.raises(ek.UsageError, match="unknown archive"):

@@ -6,13 +6,12 @@ import asyncio
 from typing import Mapping
 
 import evokit
-from evokit import history
 from evokit.archives import IslandArchive
 from evokit.files import DiffOperator, Project
 from evokit.loop import EvalFn, Limits
 from evokit.operators import Choice, Model
 from evokit.records import Individual
-from evokit.storage import Storage
+from evokit.history import History
 from evokit.strategies import IslandSampler
 
 
@@ -22,7 +21,7 @@ async def openevolve(
     models: Mapping[str, Model],
     weights: Mapping[str, float] | None = None,
     *,
-    storage: Storage,
+    history: History,
     archive: IslandArchive,
     instructions: str | None = None,
     inspirations: int = 4,
@@ -49,20 +48,21 @@ async def openevolve(
     )
 
     limits = Limits(max_evaluations, max_cost, max_failures)
+    score = evokit.as_eval_fn(eval_fn)
 
     async def worker() -> None:
-        while not limits.reached(storage):
-            asked = await evokit.ask(storage, archive, strategy, operator)
+        while not limits.reached(history):
+            asked = await evokit.ask(history, archive, strategy, operator)
             if asked.exhausted:
                 return
-            evaluated = await evokit.evaluate(storage, asked.individuals, eval_fn=eval_fn)
-            before = history.counts(storage)["evaluated"]
-            await evokit.tell(storage, archive, evaluated)
-            if before // migrate_every < history.counts(storage)["evaluated"] // migrate_every:
+            evaluations = await asyncio.gather(*map(score, asked.individuals))
+            before = history.counts()["evaluated"]
+            await evokit.tell(history, archive, asked.individuals, evaluations)
+            if before // migrate_every < history.counts()["evaluated"] // migrate_every:
                 archive.migrate(top=migrate_top)
 
     await operator.check()
-    with storage.lock("driver"):
+    with history.storage.lock("driver"):
         await asyncio.gather(*(worker() for _ in range(workers)))
-    history.note(storage, "stop", limits.reached(storage) or "nothing left to select")
+    history.note("stop", limits.reached(history) or "nothing left to select")
     return archive.best()

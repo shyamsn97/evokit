@@ -1,27 +1,30 @@
-"""The three functions every recipe is built from:
+"""What every recipe is built from:
 
-    asked = await evokit.ask(storage, archive, strategy, operator)
-    evaluated = await evokit.evaluate(storage, asked.individuals, eval_fn=eval_fn)
-    admitted = await evokit.tell(storage, archive, evaluated)
+    @evokit.eval_fn(timeout="10m")
+    def score(individual) -> Evaluation: ...
+
+    history = evokit.History(storage)
+    asked = await evokit.ask(history, archive, strategy, operator)
+    evaluations = await asyncio.gather(*map(score, asked.individuals))
+    admitted = await evokit.tell(history, archive, asked.individuals, evaluations)
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import traceback
 from concurrent.futures import Executor
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Iterable
 
-from evokit import history
 from evokit.archive import Archive
 from evokit.errors import OperatorError
+from evokit.history import History
 from evokit.operator import Operator
 from evokit.records import Asked, Evaluation, Failure, Individual
-from evokit.storage import Storage
 from evokit.strategy import Strategy
 from evokit.util import new_id, parse_duration, truncate
 
@@ -29,32 +32,56 @@ log = logging.getLogger("evokit")
 
 FEEDBACK_LIMIT = 4000
 
-EvalFn = Callable[[Individual, Path], "Evaluation | Awaitable[Evaluation]"]
-"""`eval_fn(individual, workdir) -> Evaluation`, sync or async."""
+EvalFn = Callable[[Individual], "Evaluation | Awaitable[Evaluation]"]
+"""`eval_fn(individual) -> Evaluation`, sync or async."""
 
 
 def is_async(fn: Callable) -> bool:
     return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(getattr(fn, "__call__", None))
 
 
-async def call_eval_fn(
-    eval_fn: EvalFn, individual: Individual, workdir: Path, *, timeout: str | float | None = None, executor: Executor | None = None
-) -> Evaluation:
-    """Await an async eval_fn; run a sync one in `executor` (default: threads)."""
-    if is_async(eval_fn):
-        call = eval_fn(individual, workdir)
-    else:
-        call = asyncio.get_running_loop().run_in_executor(executor, eval_fn, individual, workdir)
-    evaluation = await asyncio.wait_for(call, parse_duration(timeout))
-    if not isinstance(evaluation, Evaluation):
-        raise TypeError(f"eval_fn must return an Evaluation, not {type(evaluation).__name__}")
-    return evaluation
+def eval_fn(fn: EvalFn | None = None, *, timeout: str | float | None = None, executor: Executor | None = None):
+    """Make `fn(individual) -> Evaluation`, sync or async, an async eval function that never raises:
+    a crash, a timeout or a wrong return type becomes an evaluation with no objectives.
+
+    A sync `fn` runs in `executor` (default: threads), so a slow evaluation does not block others.
+    Usable bare (`@eval_fn`) or with options (`@eval_fn(timeout="10m")`).
+    """
+
+    def wrap(fn: EvalFn) -> Callable[[Individual], Awaitable[Evaluation]]:
+        limit = parse_duration(timeout)
+
+        @functools.wraps(fn)
+        async def wrapped(individual: Individual) -> Evaluation:
+            try:
+                if is_async(fn):
+                    call = fn(individual)
+                else:
+                    call = asyncio.get_running_loop().run_in_executor(executor, fn, individual)
+                evaluation = await asyncio.wait_for(call, limit)
+            except asyncio.TimeoutError:
+                return Evaluation(feedback=f"evaluation timed out after {timeout}")
+            except Exception:
+                return Evaluation(feedback=truncate(traceback.format_exc(), FEEDBACK_LIMIT))
+            if not isinstance(evaluation, Evaluation):
+                return Evaluation(feedback=f"eval_fn must return an Evaluation, not {type(evaluation).__name__}")
+            return evaluation
+
+        wrapped.is_eval_fn = True
+        return wrapped
+
+    return wrap if fn is None else wrap(fn)
 
 
-async def ask(storage: Storage, archive: Archive, strategy: Strategy, operator: Operator, n: int = 1) -> Asked:
+def as_eval_fn(fn: EvalFn) -> Callable[[Individual], Awaitable[Evaluation]]:
+    """`fn` decorated with eval_fn, unless it already is."""
+    return fn if getattr(fn, "is_eval_fn", False) else eval_fn(fn)
+
+
+async def ask(history: History, archive: Archive, strategy: Strategy, operator: Operator, n: int = 1) -> Asked:
     """Up to n individuals to evaluate. Children a crash left unevaluated come first; otherwise select n
     times and create from each selection. Every creation and failure is recorded with its cost."""
-    if pending := history.claim_pending(storage, n):
+    if pending := history.claim_pending(n):
         return Asked(tuple(pending))
     selections = await strategy.select(archive, n)
     if not selections:
@@ -69,47 +96,18 @@ async def ask(storage: Storage, archive: Archive, strategy: Strategy, operator: 
             reason = truncate(exc.reason, FEEDBACK_LIMIT)
             if exc.logs:
                 folder = f"failed/{new_id()}"
-                _write_logs(storage, folder, exc.logs)
+                history.write_logs(folder, exc.logs)
                 reason += f"\n\nlogs: {folder}/"
-            history.note(storage, "failed", reason, exc.usage)
+            history.note("failed", reason, exc.usage)
             continue
         parents = tuple(p.id for p in selection.parents)
         for child in offspring.children:
-            _write_logs(storage, f"artifacts/{child.id}", offspring.logs)
-        history.record_created(storage, offspring.children, parents, offspring.usage)
+            history.write_logs(f"artifacts/{child.id}", offspring.logs)
+        history.record_created(offspring.children, parents, offspring.usage)
         for child in offspring.children:
             log.info("created %s from %s", child.id, ", ".join(parents) or "nothing")
         individuals += offspring.children
     return Asked(tuple(individuals), tuple(failures))
-
-
-def _write_logs(storage: Storage, folder: str, logs) -> None:
-    for name, data in logs.items():
-        storage.write(f"{folder}/{name}", data)
-
-
-async def evaluate(
-    storage: Storage,
-    individuals: Iterable[Individual],
-    *,
-    eval_fn: EvalFn,
-    timeout: str | float | None = None,
-    executor: Executor | None = None,
-) -> list[Individual]:
-    """Evaluate each individual concurrently, in its artifact folder. A crash or a timeout becomes an
-    evaluation with no objectives."""
-
-    async def one(individual: Individual) -> Individual:
-        with storage.local(f"artifacts/{individual.id}") as workdir:
-            try:
-                evaluation = await call_eval_fn(eval_fn, individual, workdir, timeout=timeout, executor=executor)
-            except asyncio.TimeoutError:
-                evaluation = Evaluation(feedback=f"evaluation timed out after {timeout}")
-            except Exception:
-                evaluation = Evaluation(feedback=truncate(traceback.format_exc(), FEEDBACK_LIMIT))
-        return individual.with_evaluation(evaluation)
-
-    return list(await asyncio.gather(*(one(i) for i in individuals)))
 
 
 @dataclass(frozen=True)
@@ -124,31 +122,50 @@ class Limits:
     max_cost: float | None = None
     max_failures: int | None = 10
 
-    def reached(self, storage: Storage) -> str | None:
+    def reached(self, history: History) -> str | None:
         """Why the loop should stop, or None."""
-        if self.max_evaluations is not None and history.counts(storage)["evaluated"] >= self.max_evaluations:
+        if self.max_evaluations is not None and history.counts()["evaluated"] >= self.max_evaluations:
             return f"{self.max_evaluations} evaluations"
-        if self.max_cost is not None and history.usage(storage)["cost_usd"] >= self.max_cost:
+        if self.max_cost is not None and history.usage()["cost_usd"] >= self.max_cost:
             return f"${self.max_cost:g} spent"
-        if self.max_failures is not None and history.failures_in_a_row(storage) >= self.max_failures:
-            last = truncate(history.last_note(storage, "failed") or "", 1000)
+        if self.max_failures is not None and history.failures_in_a_row() >= self.max_failures:
+            last = truncate(history.last_note("failed") or "", 1000)
             return f"{self.max_failures} operator failures in a row; the last: {last}"
         return None
 
+    def remaining_cost(self, history: History) -> float | None:
+        """US dollars left under `max_cost`, or None if there is no cost limit."""
+        if self.max_cost is None:
+            return None
+        return max(0.0, self.max_cost - history.usage()["cost_usd"])
 
-async def tell(storage: Storage, archive: Archive, individuals: Iterable[Individual]) -> list[Individual]:
-    """Add evaluated individuals to the archive and record them. Returns the ones the archive admitted."""
+
+async def tell(
+    history: History, archive: Archive, individuals: Iterable[Individual], evaluations: Iterable[Evaluation]
+) -> list[Individual]:
+    """Give each individual its evaluation, store the evaluation's logs in its artifact folder, add it
+    to the archive and record it. Returns the ones the archive admitted, with their evaluations."""
     admitted = []
-    for individual in individuals:
-        if individual.evaluation is None:
-            raise ValueError(f"individual {individual.id} has no evaluation; evaluate it before telling it")
+    for individual, evaluation in zip(individuals, evaluations, strict=True):
+        history.write_logs(f"artifacts/{individual.id}", evaluation.logs)
+        individual = individual.with_evaluation(replace(evaluation, logs={}))
         added = bool(archive.add(individual))
-        history.record_evaluated(storage, individual, added=added)
-        scores = ", ".join(f"{k}={v:.6g}" for k, v in individual.evaluation.objectives.items()) or "failed"
+        history.record_evaluated(individual, added=added)
+        scores = ", ".join(f"{k}={v:.6g}" for k, v in evaluation.objectives.items()) or "failed"
         log.info("evaluated %s: %s%s", individual.id, scores, " (added)" if added else "")
         if added:
             admitted.append(individual)
     return admitted
 
 
-__all__ = ["EvalFn", "Limits", "ask", "call_eval_fn", "evaluate", "tell"]
+async def submit(history: History, archive: Archive, eval_fn: EvalFn, individual: Individual) -> Individual:
+    """Record `individual` as created, score it with `eval_fn` and offer it to the archive: how an
+    agent keeps a version, since the score always comes from `eval_fn`, never from the caller.
+    Returns it with its evaluation and info["admitted"]."""
+    history.record_created([individual], individual.parents)
+    evaluation = await as_eval_fn(eval_fn)(individual)
+    admitted = await tell(history, archive, [individual], [evaluation])
+    return individual.with_evaluation(replace(evaluation, logs={})).with_info(admitted=bool(admitted))
+
+
+__all__ = ["EvalFn", "Limits", "as_eval_fn", "ask", "eval_fn", "submit", "tell"]

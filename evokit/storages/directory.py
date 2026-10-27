@@ -58,6 +58,11 @@ class DirectoryStorage(Storage):
     def read(self, path: str) -> bytes:
         return self._path(path).read_bytes()
 
+    def read_from(self, path: str, offset: int) -> bytes:
+        with open(self._path(path), "rb") as f:
+            f.seek(offset)
+            return f.read()
+
     def exists(self, path: str) -> bool:
         return self._path(path).is_file()
 

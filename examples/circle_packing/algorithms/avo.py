@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import asyncio
 
-from algorithms.common import arguments, claude_code, packing_task, report, seed_archive
+from algorithms.common import arguments, claude_code, coding_agent, packing_task, report, seed_archive
 
+import evokit as ek
 from evokit import recipes
 from evokit.archives import BestArchive
 from evokit.storages import DirectoryStorage
@@ -23,11 +24,12 @@ from evokit.storages import DirectoryStorage
 
 async def run(directory: str, agent=None, max_cost: float = 5.0, max_evaluations: int | None = None, **options):
     storage = DirectoryStorage(directory)
+    history = ek.History(storage)
     task = packing_task(storage)
     archive = BestArchive("score", ties="accept", storage=storage)
-    await seed_archive(storage, archive, task.project.seed_genome(), task.eval_fn)
+    await seed_archive(history, archive, task.project.seed_genome(), task.eval_fn)
     await recipes.avo(
-        task.project, task.eval_fn, agent or claude_code(max_turns=300, timeout="3h"), storage=storage, archive=archive, instructions=task.instructions,
+        task.project, task.eval_fn, agent or claude_code(max_turns=300, timeout="3h"), history=history, archive=archive, instructions=task.instructions,
         max_cost=max_cost, max_evaluations=max_evaluations, **options,
     )
     return storage, archive
@@ -35,7 +37,8 @@ async def run(directory: str, agent=None, max_cost: float = 5.0, max_evaluations
 
 def main() -> None:
     args = arguments("AVO on circle packing", max_cost=5.0)
-    storage, archive = asyncio.run(run(args.dir, max_cost=args.max_cost, max_evaluations=args.max_evaluations))
+    agent = coding_agent(args.agent, long=True)
+    storage, archive = asyncio.run(run(args.dir, agent, max_cost=args.max_cost, max_evaluations=args.max_evaluations))
     report(storage, archive)
 
 

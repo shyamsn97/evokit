@@ -20,7 +20,7 @@ EVALUATE = textwrap.dedent(
     """
 )
 
-# A fake coding agent: bumps X by 0.5, uses a draft evaluation, reports usage as JSON.
+# A fake coding agent: bumps X by 0.5, scores a draft if it has the score tool, reports usage as JSON.
 FAKE_AGENT = textwrap.dedent(
     """
     import json, os, re, subprocess, sys
@@ -29,8 +29,8 @@ FAKE_AGENT = textwrap.dedent(
     x = float(re.search(r"X = ([\\d.\\-]+)", text).group(1))
     open("main.py", "w").write(f"X = {x + 0.5}\\n")
     draft = None
-    if os.environ.get("EVOKIT_DRAFT_EVAL"):
-        draft = json.loads(subprocess.run([os.environ["EVOKIT_DRAFT_EVAL"]], capture_output=True, text=True).stdout)
+    if "evokit score" in prompt:
+        draft = json.loads(subprocess.run(["evokit", "score"], capture_output=True, text=True).stdout)
     if os.environ.get("TAMPER"):
         open("evaluate.py", "a").write("# tampered\\n")
     redirect = "Step back" in prompt

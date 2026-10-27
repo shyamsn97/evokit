@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import asyncio
 
-from algorithms.common import arguments, claude_code, packing_task, report, seed_archive
+from algorithms.common import arguments, claude_code, coding_agent, packing_task, report, seed_archive
 
+import evokit as ek
 from evokit import recipes
 from evokit.archives import SimplerBestArchive
 from evokit.files import with_lines
@@ -33,24 +34,26 @@ SIMPLICITY = (
 )
 
 
-async def run(directory: str, agent=None, max_evaluations: int | None = None):
+async def run(directory: str, agent=None, max_evaluations: int | None = None, max_cost: float | None = None):
     """A fresh headless coding-agent session per change."""
     storage = DirectoryStorage(directory)
+    history = ek.History(storage)
     task = packing_task(storage)
     eval_fn = with_lines(task.eval_fn)
     archive = SimplerBestArchive("score", size="lines", storage=storage)
-    await seed_archive(storage, archive, task.project.seed_genome(), eval_fn)
+    await seed_archive(history, archive, task.project.seed_genome(), eval_fn)
     await recipes.autoresearch(
-        task.project, eval_fn, agent or claude_code(), storage=storage, archive=archive,
+        task.project, eval_fn, agent or claude_code(), history=history, archive=archive,
         instructions=f"{task.instructions}\n\n{SIMPLICITY}", objective="score",
-        results=storage.root / "results.tsv", max_evaluations=max_evaluations,
+        results=storage.root / "results.tsv", max_evaluations=max_evaluations, max_cost=max_cost,
     )
     return storage, archive
 
 
 def main() -> None:
     args = arguments("autoresearch on circle packing")
-    storage, archive = asyncio.run(run(args.dir, max_evaluations=args.max_evaluations))
+    agent = coding_agent(args.agent)
+    storage, archive = asyncio.run(run(args.dir, agent, max_evaluations=args.max_evaluations, max_cost=args.max_cost))
     report(storage, archive)
 
 

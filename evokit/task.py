@@ -9,8 +9,8 @@
 `load_task(dir)` reads the folder into a Task: a Project (genome files plus the read-only
 environment), an eval function (ScriptEvaluator over the `evaluate` command), the instructions
 (TASK.md), and the `run` section naming the archive, strategy and operator. `task.open(storage)`
-builds those components on the storage; a new storage is seeded with the task's genome files,
-an existing one continues where it stopped. `evokit init NAME` writes a working template.
+builds those components on the storage, as a Run; a new storage is seeded with the task's genome
+files, an existing one continues where it stopped. `evokit init NAME` writes a working template.
 """
 
 from __future__ import annotations
@@ -39,18 +39,17 @@ from evokit.archives import (
     UnboundedArchive,
 )
 from evokit.errors import UsageError
+from evokit.agents import ClaudeCode, CodingAgentOperator, CommandAgent
 from evokit.files import (
     DEFAULT_IGNORE,
     DEFAULT_PROTECTED,
-    ClaudeCode,
-    CodingAgentOperator,
-    CommandAgent,
     DiffOperator,
     FileRewriteOperator,
     Project,
     ScriptEvaluator,
 )
-from evokit.loop import EvalFn
+from evokit.history import LOG, History
+from evokit.loop import EvalFn, as_eval_fn, tell
 from evokit.operator import Operator
 from evokit.operators import AnthropicModel
 from evokit.records import Individual
@@ -58,6 +57,7 @@ from evokit.storage import Storage
 from evokit.storages import DirectoryStorage
 from evokit.strategies import Greedy, IslandSampler, ProportionalSelection, Tournament
 from evokit.strategy import Strategy
+from evokit.util import background, truncate
 
 CONFIG, INSTRUCTIONS = "config.yaml", "TASK.md"
 RUN_TASK = "run/task.json"
@@ -83,6 +83,22 @@ OPERATORS = ("none", "diff", "rewrite", "coding-agent")
 
 
 @dataclass(frozen=True)
+class Run:
+    """A run opened from its storage: what the `evokit` commands work on. A run opened only to be
+    read (`open_history`) has just its storage and history; `tools` are extra commands from the
+    task's factory."""
+
+    storage: Storage
+    history: History
+    archive: Archive | None = None
+    strategy: Strategy | None = None
+    operator: Operator | None = None
+    eval_fn: EvalFn | None = None
+    task: "Task | None" = None
+    tools: tuple[Callable, ...] = ()
+
+
+@dataclass(frozen=True)
 class Task:
     directory: Path
     project: Project
@@ -100,12 +116,13 @@ class Task:
         """The task's genome files as they are now, as a fresh individual."""
         return Individual.new(self.project.seed_genome(), name="seed")
 
-    def components(self, storage: Storage) -> tuple[Archive, Strategy, Operator | None]:
-        """The archive (on `storage`, so it restores itself), strategy and operator the `run` section names."""
-        archive, strategy, operator, _, _ = self._build(storage)
+    def components(self, storage: Storage, history: History | None = None) -> tuple[Archive, Strategy, Operator | None]:
+        """The archive (on `storage`, so it restores itself), strategy and operator the `run` section
+        names; a coding agent operator reads the run through `history` (default: a new one)."""
+        archive, strategy, operator, _, _ = self._build(storage, history)
         return archive, strategy, operator
 
-    def _build(self, storage: Storage) -> tuple[Archive, Strategy, Operator | None, EvalFn, tuple]:
+    def _build(self, storage: Storage, history: History | None = None) -> tuple[Archive, Strategy, Operator | None, EvalFn, tuple]:
         if "factory" in self.run:
             return self._from_factory(storage)
         run = self.run
@@ -116,9 +133,9 @@ class Task:
             strategy = STRATEGIES[run.get("strategy", "greedy")](self.objective, **run.get("strategy_options", {}))
         except KeyError as exc:
             raise UsageError(f"{CONFIG}: unknown archive or strategy {exc}", hint=f"archives: {', '.join(ARCHIVES)}; strategies: {', '.join(STRATEGIES)}") from None
-        return archive, strategy, self._operator(), self.eval_fn, ()
+        return archive, strategy, self._operator(history or History(storage)), self.eval_fn, ()
 
-    def _operator(self) -> Operator | None:
+    def _operator(self, history: History) -> Operator | None:
         kind, options = self.run.get("operator", "none"), dict(self.run.get("operator_options", {}))
         if kind == "none":
             return None
@@ -131,13 +148,14 @@ class Task:
             agent = self.run.get("agent", "claude")
             agent = ClaudeCode() if agent == "claude" else CommandAgent(agent)
             if options.get("max_draft_evals"):
-                options["draft_evaluate"] = self.eval_fn
-            return CodingAgentOperator(agent, self.project, instructions=self.instructions, **options)
+                options["eval_fn"] = self.eval_fn
+            return CodingAgentOperator(agent, self.project, history=history, instructions=self.instructions, **options)
         raise UsageError(f"{CONFIG}: unknown operator {kind!r}", hint=f"operators: {', '.join(OPERATORS)}")
 
     def _from_factory(self, storage: Storage):
         """`factory: MODULE:NAME`: build(task, storage) returns the archive, strategy, optionally an
-        operator and an eval function (default: the task's), and anything else with commands."""
+        operator and an eval function (default: the task's), and optionally a list of functions,
+        which become extra commands."""
         with _working_directory(self.directory):
             build = load_factory(self.run["factory"], self.directory)
             returned = build(self, storage)
@@ -148,26 +166,37 @@ class Task:
         eval_fn = _one([o for o in objects if callable(o) and not isinstance(o, type)], "eval function", required=False)
         if archive.storage is not storage:
             raise UsageError("the factory's archive does not use the run's storage", hint="build it with storage=storage")
-        extras = tuple(o for o in objects if o is not archive and o is not strategy and o is not operator and o is not eval_fn)
-        return archive, strategy, operator, eval_fn or self.eval_fn, extras
+        tools = tuple(tool for o in objects if isinstance(o, list) for tool in o)
+        return archive, strategy, operator, eval_fn or self.eval_fn, tools
 
-    def open(self, storage: Storage):
-        """A run of this task on `storage`, as RunCommands. A new storage is seeded first: the task's
-        genome files are evaluated and added to the archive (UsageError, and nothing recorded, if
-        they fail). An existing one continues: its archive restores itself and nothing is re-run."""
-        from evokit.interface.run import RunCommands
-
+    def open(self, storage: Storage) -> Run:
+        """A run of this task on `storage`. A new storage is seeded first: the task's genome files
+        are evaluated and added to the archive (UsageError, and nothing recorded, if they fail). An
+        existing one continues: its archive restores itself and nothing is re-run."""
         if storage.exists(RUN_TASK):
             recorded = Path(json.loads(storage.read(RUN_TASK))["task"])
             if recorded != self.directory:
                 raise UsageError(f"this run belongs to the task {recorded}, not {self.directory}", hint="use another --dir")
-        archive, strategy, operator, eval_fn, extras = self._build(storage)
-        run = RunCommands(storage, archive, strategy, operator, eval_fn, task=self, extras=extras)
+        history = History(storage)
+        archive, strategy, operator, eval_fn, tools = self._build(storage, history)
+        run = Run(storage, history, archive, strategy, operator, eval_fn, self, tools)
         if not len(archive):
-            run.seed(self.seed())
+            seed(run, self.seed())
         if not storage.exists(RUN_TASK):
             storage.write(RUN_TASK, json.dumps({"task": str(self.directory)}).encode())
         return run
+
+
+def seed(run: Run, individual: Individual) -> Individual:
+    """Evaluate `individual` and add it to the archive. Raises UsageError, recording nothing, if it fails its evaluation."""
+    evaluation = background.run(as_eval_fn(run.eval_fn)(individual))
+    if not evaluation.objectives:
+        raise UsageError(
+            f"the seed failed its evaluation: {truncate(evaluation.feedback, 2000)}",
+            hint="fix the task's files or its evaluator, then run the command again",
+        )
+    background.run(tell(run.history, run.archive, [individual], [evaluation]))
+    return individual.with_evaluation(evaluation)
 
 
 def load_task(directory: str | Path, environment: str | Path | None = None, ignore: Sequence[str] = ()) -> Task:
@@ -208,8 +237,8 @@ def load_task(directory: str | Path, environment: str | Path | None = None, igno
     )
 
 
-def open_run(directory: str | Path, task: str | Path | None = None):
-    """The run in `directory`, as RunCommands. A new directory needs `task`, and is seeded from it."""
+def open_run(directory: str | Path, task: str | Path | None = None) -> Run:
+    """The run in `directory`. A new directory needs `task`, and is seeded from it."""
     storage = DirectoryStorage(directory)
     if task is None:
         if not storage.exists(RUN_TASK):
@@ -219,6 +248,15 @@ def open_run(directory: str | Path, task: str | Path | None = None):
     inside = _relative(storage.root, task_dir)
     loaded = load_task(task_dir, environment=storage.root / "env", ignore=(f"{inside}/**",) if inside else ())
     return loaded.open(storage)
+
+
+def open_history(directory: str | Path) -> Run:
+    """The run in `directory`, for reading only: no task needed, so it opens any run directory,
+    including ones a Python recipe wrote."""
+    if not (Path(directory) / LOG).is_file():
+        raise UsageError(f"no run in {Path(directory)}", hint="point --dir (or $EVOKIT_DIR) at a run directory")
+    storage = DirectoryStorage(directory)
+    return Run(storage, History(storage))
 
 
 def init_task(directory: str | Path) -> Path:

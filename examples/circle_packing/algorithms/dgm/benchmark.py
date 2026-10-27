@@ -9,12 +9,12 @@ import shutil
 import statistics
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import evokit as ek
-from evokit import history
-from evokit.files import script_agent
+from evokit.agents import script_agent
+from evokit.files.evaluator import read_folder
 from evokit.records import merge_usage
 from evokit.util import truncate
 
@@ -52,8 +52,8 @@ class PackingBenchmark:
     3. Only for agents that beat the seed agent's stage 2 score: `repeats` more rounds, averaged.
 
     Every task runs in a fresh copy with a fresh evaluate.py, so an agent cannot change how it
-    is scored. Logs go to `workdir/logs/` (what SelfModify reads) and the best N=26 packing to
-    `workdir/best_main.py`. The seed agent's stage 2 score is read from the history in `storage`.
+    is scored. The evaluation's logs hold `logs/` (what SelfModify reads) and the best N=26
+    packing as `best_main.py`. The seed agent's stage 2 score is read from the history in `storage`.
     """
 
     def __init__(self, storage: ek.Storage, sizes=(20, 26, 32), repeats: int = 2, timeout: str = "15m"):
@@ -61,12 +61,20 @@ class PackingBenchmark:
 
     def seed_score(self) -> float | None:
         return next(
-            (i.objective("stage2") for i in history.evaluated(self.storage) if not i.parents and i.objective("stage2") is not None),
+            (i.objective("stage2") for i in ek.History(self.storage).evaluated() if not i.parents and i.objective("stage2") is not None),
             None,
         )
 
-    async def __call__(self, individual: ek.Individual, workdir: Path) -> ek.Evaluation:
-        logs = Path(workdir) / "logs"
+    async def __call__(self, individual: ek.Individual) -> ek.Evaluation:
+        workdir = Path(tempfile.mkdtemp(prefix="dgm-eval-"))
+        try:
+            evaluation = await self._evaluate(individual, workdir)
+            return replace(evaluation, logs=read_folder(workdir))
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _evaluate(self, individual: ek.Individual, workdir: Path) -> ek.Evaluation:
+        logs = workdir / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         agent_dir = Path(tempfile.mkdtemp(prefix="dgm-agent-"))
         try:
@@ -83,7 +91,7 @@ class PackingBenchmark:
         finally:
             shutil.rmtree(agent_dir, ignore_errors=True)
         best = max((s for s in solves if s.n == 26 and s.valid), key=lambda s: s.radii_sum)
-        (Path(workdir) / "best_main.py").write_text(best.main)
+        (workdir / "best_main.py").write_text(best.main)
         return ek.Evaluation(
             {
                 "score": statistics.mean(s.normalized for s in solves),

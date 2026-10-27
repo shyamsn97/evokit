@@ -9,7 +9,6 @@ import random
 from typing import Any, Callable, Mapping, Sequence
 
 import evokit
-from evokit import history
 from evokit.archives import IslandArchive
 from evokit.archives.islands import genome_text
 from evokit.files import DiffOperator, FileRewriteOperator, Project
@@ -17,7 +16,7 @@ from evokit.loop import EvalFn, Limits
 from evokit.operators import Model
 from evokit.operators.prompts import describe_individual
 from evokit.records import Individual, Selection
-from evokit.storage import Storage
+from evokit.history import History
 from evokit.strategy import Strategy
 from evokit.util import truncate
 
@@ -58,7 +57,7 @@ async def shinka(
     embed: Callable[[str], Sequence[float]],
     judge: Model,
     summarizer: Model,
-    storage: Storage,
+    history: History,
     archive: IslandArchive,
     objective: str = "score",
     workers: int = 4,
@@ -79,10 +78,11 @@ async def shinka(
     passes a seeded archive, e.g. IslandArchive(islands=2, features=(), cell_size=50).
     """
     strategy = ShinkaParents(objective=objective, seed=seed)
-    bandit = ModelBandit(models, objective=objective, seed=seed).fit(storage)
+    bandit = ModelBandit(models, objective=objective, seed=seed).fit(history)
     rng = random.Random(seed)
-    notes = history.last_note(storage, "meta") or ""
+    notes = history.last_note("meta") or ""
     limits = Limits(max_evaluations, max_cost, max_failures)
+    score = evokit.as_eval_fn(eval_fn)
 
     def parent_of(child: Individual) -> Individual | None:
         if not child.parents:
@@ -91,45 +91,46 @@ async def shinka(
         if found is not None:
             return found
         try:
-            return history.individual(storage, child.parents[0])
+            return history.individual(child.parents[0])
         except KeyError:
             return None
 
     async def worker() -> None:
         nonlocal notes
-        while not limits.reached(storage):
+        while not limits.reached(history):
             kind = rng.choices(list(KINDS), list(KINDS.values()))[0]
             name = bandit.choose()
             prompt = instructions + (f"\n\nWhat has worked so far:\n{notes}" if notes else "")
             operator = make_operator(kind, models[name], project, prompt)
 
-            asked = await evokit.ask(storage, archive, strategy, operator)
+            asked = await evokit.ask(history, archive, strategy, operator)
             if asked.exhausted:
                 return
             novel = []
             for child in asked.individuals:
-                if await is_novel(child, archive, embed, judge, storage, threshold):
+                if await is_novel(child, archive, embed, judge, history, threshold):
                     novel.append(child.with_info(operator=f"{kind}/{name}"))
                 else:
-                    history.discard(storage, child, "not novel")
-            evaluated = await evokit.evaluate(storage, novel, eval_fn=eval_fn)
-            before = history.counts(storage)
-            await evokit.tell(storage, archive, evaluated)
-            for child in evaluated:
+                    history.discard(child, "not novel")
+            evaluations = await asyncio.gather(*map(score, novel))
+            before = history.counts()
+            await evokit.tell(history, archive, novel, evaluations)
+            for child, evaluation in zip(novel, evaluations):
+                child = child.with_evaluation(evaluation)
                 bandit.reward(child, parent_of(child))
-            after = history.counts(storage)
+            after = history.counts()
             if before["added"] // every < after["added"] // every:
                 archive.migrate(top=1)
             if before["evaluated"] // every < after["evaluated"] // every:
                 reply = await summarizer.generate(META_PROMPT + "\n\n".join(describe_individual(m) for m in archive.best_k(20)))
                 notes = reply.text
-                history.note(storage, "meta", notes, reply.usage)
+                history.note("meta", notes, reply.usage)
 
     for model in {id(m): m for m in (*models.values(), judge, summarizer)}.values():
         await model.check()
-    with storage.lock("driver"):
+    with history.storage.lock("driver"):
         await asyncio.gather(*(worker() for _ in range(workers)))
-    history.note(storage, "stop", limits.reached(storage) or "nothing left to select")
+    history.note("stop", limits.reached(history) or "nothing left to select")
     return archive.best()
 
 
@@ -178,11 +179,11 @@ class ModelBandit:
         self.total = {name: 0.0 for name in self.names}
         self.rng = random.Random(seed)
 
-    def fit(self, storage: Storage) -> "ModelBandit":
+    def fit(self, history: History) -> "ModelBandit":
         """Reward every child already in the history, so a continued run keeps what it learned."""
-        for child in history.evaluated(storage):
+        for child in history.evaluated():
             try:
-                parent = history.individual(storage, child.parents[0]) if child.parents else None
+                parent = history.individual(child.parents[0]) if child.parents else None
             except KeyError:
                 parent = None
             self.reward(child, parent)
@@ -229,7 +230,7 @@ async def is_novel(
     archive: IslandArchive,
     embed: Callable[[str], Any],
     judge: Model,
-    storage: Storage,
+    history: History,
     threshold: float = 0.95,
 ) -> bool:
     """False if the child is a near-copy of an archive member: its embedding is within `threshold`
@@ -243,5 +244,5 @@ async def is_novel(
     if similarity < threshold:
         return True
     reply = await judge.generate(JUDGE_PROMPT.format(a=truncate(genome_text(closest), 20_000), b=truncate(genome_text(child), 20_000)))
-    history.note(storage, "novelty-judge", reply.text[:200], reply.usage)
+    history.note("novelty-judge", reply.text[:200], reply.usage)
     return not reply.text.strip().upper().startswith("SAME")

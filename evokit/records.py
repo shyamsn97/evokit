@@ -10,11 +10,14 @@ from evokit.util import new_id
 
 @dataclass(frozen=True)
 class Evaluation:
-    """The result of evaluating an individual. No objectives means the evaluation failed."""
+    """The result of evaluating an individual. No objectives means the evaluation failed. `logs`
+    (file name -> contents) are stored in the individual's artifact folder by `tell`, not in the
+    history."""
 
     objectives: dict[str, float] = field(default_factory=dict)
     feedback: str = ""
     usage: dict[str, float] = field(default_factory=dict)
+    logs: Mapping[str, bytes] = field(default_factory=dict, compare=False, repr=False)
 
     def to_dict(self) -> dict:
         return {"objectives": dict(self.objectives), "feedback": self.feedback, "usage": dict(self.usage)}

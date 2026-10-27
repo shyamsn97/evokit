@@ -1,0 +1,176 @@
+"""Download CO-Bench problems and make an evokit task folder for each.
+
+CO-Bench (Sun et al., arXiv 2504.04310) is 36 combinatorial-optimization problems from OR-Library
+and similar sources. The agent writes `solve(**instance)`; it is scored on a development set during
+the run and on a held-out test set afterwards (heldout.py). The data has no license file and is not
+part of evokit: this script fetches it from Hugging Face at a pinned revision.
+
+    cd examples/co_bench
+    python setup.py                          # the five default problems
+    python setup.py "Job shop scheduling"    # any of the 36, by name
+    python setup.py --list
+
+Each problem becomes tasks/<slug>/ (solve.py, TASK.md, config.yaml, evaluate.py, problem.json),
+with its data in data/<problem>/. Both are generated, so they are not committed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import re
+import shutil
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+DATASET = "CO-Bench/CO-Bench"
+REVISION = "6e561a36254d4315b8c2d155e81a465b634e87e1"
+DEFAULT = [
+    "Bin packing - one-dimensional",
+    "Job shop scheduling",
+    "Aircraft landing",
+    "Constrained guillotine cutting",
+    "Vehicle routing: period routing",
+]
+
+TASK = """\
+# Goal
+
+CO-Bench problem: **{problem}**.
+
+{description}
+
+# Rules
+
+- Edit only `solve.py`. `evaluate.py`, `config.yaml`, `problem.json` and this file are fixed.
+- `solve(**kwargs)` receives one instance (the inputs are described in its docstring) and returns
+  the dictionary described there. Each instance runs in a fresh process and must return within
+  {timeout:g} seconds.
+
+# Scoring
+
+`evaluate.py` runs `solve` on every development instance and checks each solution with the
+problem's own checker. An instance scores the ratio to the best known solution (1.0 matches it,
+above 1.0 beats it); an infeasible solution, an exception or a timeout scores 0. `score` is the
+mean over data files of the mean over their instances, and `feasible` is the fraction of instances
+with a feasible solution. The feedback lists every instance's score by data file.
+
+{split}
+"""
+
+SPLIT = "The final result is the same scoring on held-out test instances, which the run never sees."
+NO_SPLIT = "This problem has no separate test set: the final result is this same score."
+
+
+def slug(problem: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", problem.lower()).strip("-")
+
+
+def api(path: str) -> list | dict:
+    with urllib.request.urlopen(
+        f"https://huggingface.co/api/datasets/{DATASET}/{path}"
+    ) as response:
+        return json.load(response)
+
+
+def problems() -> list[str]:
+    return sorted(
+        e["path"] for e in api(f"tree/{REVISION}") if e["type"] == "directory"
+    )
+
+
+def download(problem: str) -> Path:
+    data = HERE / "data" / problem
+    data.mkdir(parents=True, exist_ok=True)
+    for entry in api(f"tree/{REVISION}/{urllib.parse.quote(problem)}?recursive=true"):
+        if entry["type"] != "file":
+            continue
+        target = HERE / "data" / entry["path"]
+        if target.is_file() and target.stat().st_size == entry.get("size"):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        url = f"https://huggingface.co/datasets/{DATASET}/resolve/{REVISION}/{urllib.parse.quote(entry['path'])}"
+        print(f"  {entry['path']} ({entry.get('size', 0) / 1e6:.1f} MB)")
+        with urllib.request.urlopen(url) as response, open(target, "wb") as out:
+            shutil.copyfileobj(response, out)
+    return data
+
+
+def solve_template(config: str) -> str:
+    """The config's placeholder `solve` function, as the seed solve.py."""
+    tree = ast.parse(config)
+    node = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "solve"
+    )
+    return ast.get_source_segment(config, node) + "\n"
+
+
+def make_task(problem: str, data: Path) -> Path:
+    sys.path.insert(0, str(HERE))
+    from evaluate import TIMEOUT, load_config
+
+    config_text = (data / "config.py").read_text()
+    config = load_config(data)
+    task = HERE / "tasks" / slug(problem)
+    task.mkdir(parents=True, exist_ok=True)
+    (task / "solve.py").write_text(solve_template(config_text))
+    split = SPLIT if hasattr(config, "get_dev") else NO_SPLIT
+    (task / "TASK.md").write_text(
+        TASK.format(
+            problem=problem,
+            description=config.DESCRIPTION.strip(),
+            timeout=TIMEOUT,
+            split=split,
+        )
+    )
+    (task / "problem.json").write_text(
+        json.dumps(
+            {"problem": problem, "data": str(data), "revision": REVISION}, indent=2
+        )
+        + "\n"
+    )
+    shutil.copy(HERE / "evaluate.py", task / "evaluate.py")
+    (task / "config.yaml").write_text(
+        f"# CO-Bench: {problem}. Generated by examples/co_bench/setup.py.\n"
+        "task:\n"
+        "  genome: [solve.py]\n"
+        "  evaluate: python evaluate.py\n"
+        "  timeout: 30m\n"
+        "  objective: score\n"
+        "  minimize: false\n"
+        "\n"
+        "run:\n"
+        "  archive: best\n"
+        "  strategy: greedy\n"
+        "  operator: none\n"
+    )
+    return task
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download CO-Bench problems and make evokit task folders"
+    )
+    parser.add_argument(
+        "problems", nargs="*", help=f"problem names (default: {', '.join(DEFAULT)})"
+    )
+    parser.add_argument("--list", action="store_true", help="list the 36 problems")
+    args = parser.parse_args()
+    if args.list:
+        print("\n".join(problems()))
+        return
+    known = problems()
+    for problem in args.problems or DEFAULT:
+        if problem not in known:
+            sys.exit(f"unknown problem {problem!r}; see --list")
+        print(f"{problem}:")
+        task = make_task(problem, download(problem))
+        print(f"  -> {task.relative_to(HERE)}")
+
+
+if __name__ == "__main__":
+    main()

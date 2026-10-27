@@ -8,8 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Mapping
 
+from evokit.agents.command import CommandAgent
 from evokit.errors import OperatorError
-from evokit.files.agents import CommandAgent
 from evokit.files.tree import Files
 from evokit.operator import Operator
 from evokit.records import Individual, Offspring, Selection, merge_usage

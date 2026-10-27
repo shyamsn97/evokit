@@ -1,4 +1,4 @@
-"""The pieces AVO is made of: a persistent CodingAgentOperator that scores drafts and can be redirected."""
+"""A persistent CodingAgentOperator: one conversation across children, scoring drafts, redirected between them."""
 
 import asyncio
 
@@ -6,14 +6,16 @@ import pytest
 
 import evokit as ek
 from evokit.archives import BestArchive
-from evokit.files import CodingAgentOperator, CommandAgent, Project, ScriptEvaluator
+from evokit.agents import CodingAgentOperator, CommandAgent
+from evokit.files import Project, ScriptEvaluator
+from evokit.storages import MemoryStorage
 
 
 def setup(seed, tmp_path, fake_agent):
     project = Project(seed, genome=["main.py"], environment=tmp_path / "env")
     eval_fn = ScriptEvaluator(project, "python evaluate.py")  # exits 1 when X > 3
     operator = CodingAgentOperator(
-        CommandAgent([*fake_agent, "{session}"]), project, draft_evaluate=eval_fn, persistent=True, max_draft_evals=2
+        CommandAgent([*fake_agent, "{session}"]), project, eval_fn, ek.History(MemoryStorage()), max_draft_evals=2, persistent=True
     )
     parent = ek.Individual.new(project.seed_genome()).with_evaluation(ek.Evaluation({"score": -2.0}))
     return operator, parent
@@ -27,7 +29,7 @@ def test_persistent_session_drafts_and_redirect(seed, tmp_path, fake_agent):
     (child,) = first.children
     assert child.genome.text("main.py") == "X = 1.5\n" and child.parents == (parent.id,)
     assert "draft={'score': -1.5}" in child.name and "resumed=;" not in child.name
-    assert first.usage["draft_evals"] == 1 and first.usage["cost_usd"] == pytest.approx(0.01)
+    assert first.usage["cost_usd"] == pytest.approx(0.01) and operator.history.usage()["draft_evals"] == 1
     assert operator.session == "sess-1"
 
     operator.redirect("Step back and try something else.")

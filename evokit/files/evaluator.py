@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from evokit.files.project import Project
 from evokit.files.tree import Files
-from evokit.loop import call_eval_fn
+from evokit.loop import as_eval_fn
 from evokit.records import Evaluation, Individual
 from evokit.util import parse_duration, reaped, spawned, truncate
 
@@ -51,8 +51,8 @@ class ScriptEvaluator:
 
     The command prints its metrics (a JSON object, or `name: number` lines); the numbers become
     objectives. A non-zero exit is a failed evaluation (no objectives), with stderr as feedback:
-    that is how a script rejects a program. The command finds the individual's artifact folder
-    in $EVOKIT_WORKDIR.
+    that is how a script rejects a program. Files the command writes to $EVOKIT_WORKDIR become
+    the evaluation's logs, stored in the individual's artifact folder.
     """
 
     def __init__(
@@ -67,16 +67,19 @@ class ScriptEvaluator:
         self.timeout = parse_duration(timeout)
         self.env = dict(env or {})
 
-    async def __call__(self, individual: Individual, workdir: Path | None = None) -> Evaluation:
-        return await self.evaluate_files(individual.genome, workdir)
+    async def __call__(self, individual: Individual) -> Evaluation:
+        return await self.evaluate_files(individual.genome)
 
-    async def evaluate_files(self, genome: Files, workdir: Path | None = None) -> Evaluation:
+    async def evaluate_files(self, genome: Files) -> Evaluation:
         directory = Path(tempfile.mkdtemp(prefix="evokit-eval-"))
+        workdir = Path(tempfile.mkdtemp(prefix="evokit-eval-work-"))
         try:
             await asyncio.to_thread(self.project.write, genome, directory)
-            return await self.run(directory, {"EVOKIT_WORKDIR": str(workdir)} if workdir else None)
+            evaluation = await self.run(directory, {"EVOKIT_WORKDIR": str(workdir)})
+            return replace(evaluation, logs=await asyncio.to_thread(read_folder, workdir))
         finally:
             await asyncio.to_thread(shutil.rmtree, directory, True)
+            await asyncio.to_thread(shutil.rmtree, workdir, True)
 
     async def run(self, directory: Path, env: Mapping[str, str] | None = None) -> Evaluation:
         try:
@@ -122,6 +125,11 @@ class ScriptEvaluator:
         return f"ScriptEvaluator({shlex.join(self.argv)!r})"
 
 
+def read_folder(folder: Path) -> dict[str, bytes]:
+    """Every file under `folder`, by its path relative to it."""
+    return {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
 def code_lines(text: str, comment: str = "#") -> int:
     """Non-blank lines that are not comments."""
     return sum(1 for line in text.splitlines() if line.strip() and not line.strip().startswith(comment))
@@ -131,8 +139,10 @@ def with_lines(eval_fn, name: str = "lines", comment: str = "#"):
     """An eval function that adds an objective `name`, the code lines of the genome's files, to
     every successful evaluation of `eval_fn`."""
 
-    async def evaluate_with_lines(individual: Individual, workdir: Path) -> Evaluation:
-        evaluation = await call_eval_fn(eval_fn, individual, workdir)
+    inner = as_eval_fn(eval_fn)
+
+    async def evaluate_with_lines(individual: Individual) -> Evaluation:
+        evaluation = await inner(individual)
         if not evaluation.objectives:
             return evaluation
         lines = sum(code_lines(individual.genome.text(p), comment) for p in individual.genome.paths())

@@ -6,7 +6,7 @@
 
 An arm is ALGORITHM or ALGORITHM:VARIANT; its runs go to runs/<algorithm>[-<variant>]-<k>
 (autoresearch runs unattended here; an interactive run belongs in runs/autoresearch-external-<k>).
-The report reads each run's history (evokit.history.records): the best admitted score at
+The report reads each run's history (evokit.History.records): the best admitted score at
 fractions of the dollar budget (per algorithm, since DGM scores agents and the others score
 packings), plus final cost, evaluations, and wall time. Interactive runs (an outside
 agent as the operator) do not report their model cost; pass it with --external-cost.
@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from evokit import history
+from evokit.history import LOG, History
 from evokit.storages import DirectoryStorage
 
 HERE = Path(__file__).resolve().parent
@@ -54,7 +54,7 @@ def run_arms(arms: list[str], repeats: int, out: Path, max_cost: float | None) -
 
 
 def curve(run_dir: Path, extra_cost: float | None) -> dict:
-    records = history.records(DirectoryStorage(run_dir))
+    records = History(DirectoryStorage(run_dir)).records()
     start = records[0]["time"] if records else 0.0
     best, points, kept, told, cost = None, [], 0, 0, 0.0
     for record in records:
@@ -79,7 +79,7 @@ def best_at(points: list[dict], cost: float) -> float | None:
 
 def report(runs: Path, external_costs: dict[str, float]) -> None:
     groups: dict[str, dict[str, list]] = {}
-    for run_dir in sorted(p for p in runs.iterdir() if (p / history.LOG).exists()):
+    for run_dir in sorted(p for p in runs.iterdir() if (p / LOG).exists()):
         arm = run_dir.name.rsplit("-", 1)[0]
         algorithm = arm.split("-", 1)[0]
         groups.setdefault(algorithm, {}).setdefault(arm, []).append((run_dir.name, curve(run_dir, external_costs.get(run_dir.name))))

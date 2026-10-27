@@ -1,27 +1,15 @@
-# AVO and autoresearch, as published
+# AVO
 
-**Status: AVO implemented** (`evokit/recipes/avo.py`); **autoresearch: proposal.** The
-knowledge base K is left out on purpose: a task's `TASK.md` and its files are what the agent has.
+*AVO: Agentic Variation Operators for Autonomous Evolutionary Search* (Chen, Ye, Xu et al.,
+NVIDIA, 2026, [arXiv:2603.24517](https://arxiv.org/abs/2603.24517);
+[blog post](https://developer.nvidia.com/blog/nvidia-avo-reaches-100-on-arc-agi-3-demonstrating-a-frontier-level-general-purpose-architecture-for-long-horizon-autonomous-agents/)).
+NVIDIA released no code. The one open reproduction is
+[gatordevin/avo](https://github.com/gatordevin/avo). The knowledge base K is left out on
+purpose: a task's `TASK.md` and its files are what the agent has.
 
-Sources:
+## What the paper specifies
 
-- the AVO paper, *AVO: Agentic Variation Operators for Autonomous Evolutionary Search*
-  (Chen, Ye, Xu et al., NVIDIA, 2026, [arXiv:2603.24517](https://arxiv.org/abs/2603.24517)),
-  and NVIDIA's [blog post](https://developer.nvidia.com/blog/nvidia-avo-reaches-100-on-arc-agi-3-demonstrating-a-frontier-level-general-purpose-architecture-for-long-horizon-autonomous-agents/).
-  NVIDIA released no code;
-- the one open reproduction, [gatordevin/avo](https://github.com/gatordevin/avo)
-  (`src/avo/prompts.py`, `loop.py`, `run.py`, and `docs/PAPER_MAP.md`);
-- Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), whose whole method is
-  `program.md`.
-
-Our first real run (`examples/circle_packing/runs/avo-2`: 1.60 to 2.62 in three steps, $4) worked,
-but it was not AVO as published: one Claude Code session per step, ten draft evaluations each,
-the end of the session as the commit, and a fixed sentence as the supervisor. This doc says what
-AVO is, how the recipe now does it, and what autoresearch still needs.
-
-## What AVO is
-
-The paper writes the variation step as one agent run:
+The variation step is one agent run:
 
 ```text
 Vary(P_t) = Agent(P_t, K, f)
@@ -58,11 +46,11 @@ The agent gets exactly those three things and decides everything else:
 - **Single lineage, on purpose.** "We study the single-lineage setting to isolate the effect of
   the operator itself" (§2.1). Populations and islands are future work.
 
-## How ours does it
+## How the recipe does it
 
-| the paper | evokit |
+| the paper | `evokit/recipes/avo.py` |
 | --- | --- |
-| lineage P_t | `evokit log --all`, `show`, `diff`, `grep` over the run's history ([reading-runs.md](reading-runs.md)), with the skill installed in the workspace |
+| lineage P_t | `evokit log --all`, `show`, `diff`, `grep` over the run's history ([reading a run](../reading-runs.md)), with the skill installed in the workspace |
 | knowledge base K | not modeled: `TASK.md` and the task's files |
 | the agent calls f | `$EVOKIT_DRAFT_EVAL`, no limit by default (`max_draft_evals=None`); nothing is recorded |
 | the agent commits | `$EVOKIT_COMMIT "title" "description"`: recorded, evaluated and told at once; the reply is the verdict |
@@ -96,7 +84,6 @@ it and, if no limit is reached, resumes the same conversation with "Continue the
 current best, and any pending directions.
 
 ```python
-# evokit/recipes/avo.py
 while not self.stop_reason():
     self.commits = 0
     result = await self._session(prompt, env)   # agent.with_budget(remaining).run(workspace, prompt, session=...)
@@ -118,9 +105,8 @@ async def commit(self, args):
     best = self.archive.best()
     child = Individual.new(genome, [best.id], {"operator": "avo"}, name=title, description=description)
     history.record_created(self.storage, [child], [best.id])
-    (child,) = await evokit.evaluate(self.storage, [child], eval_fn=self.eval_fn)
-    kept = bool(await evokit.tell(self.storage, self.archive, [child]))
-    ...
+    evaluation = await self.eval_fn(child)
+    kept = bool(await evokit.tell(self.storage, self.archive, [child], [evaluation]))
     return {"id": child.id, "kept": kept, "objectives": ..., "feedback": ..., "best": {...}, **self._news()}
 ```
 
@@ -132,7 +118,7 @@ The agent sees, for example:
 ```
 
 An unchanged genome is refused ("nothing changed since the best version"), so a commit is always a
-new version. The AVO loop does not go through `ask`, because one agent run produces any number of
+new version. The loop does not go through `ask`, because one agent run produces any number of
 versions; the history, archive, limits and driver lock are the same.
 
 ### Limits
@@ -179,17 +165,16 @@ def _progress(self, attempt: Individual, best: Individual) -> None:
 A stall is counted in attempts: every draft and every commit that does not strictly beat the
 best score, reset by one that does (a draft counts as progress before it is committed). Counting
 commits alone does not work: the agent commits only versions its drafts showed were better, so
-in a real run (`runs/avo-4`) all 9 commits improved while the agent drafted the same score over
-and over, and a commit-based trigger never fired. Ties are kept, so counting rejections would
-miss a plateau too.
+in a real run all 9 commits improved while the agent drafted the same score over and over, and a
+commit-based trigger never fired. Ties are kept, so counting rejections would miss a plateau too.
 
 After `stall_after` attempts (default 5; `None` turns the supervisor off), the recipe starts the
-supervisor in the background and the count starts over. In the $5 runs (`runs/avo-4`, `avo-5`), the
-agent improved every 1 to 4 attempts for most of the run and plateaued for 5 to 10 near the end,
-so 5 fires at the plateau without interrupting steady progress. The supervisor is the same agent, in a fresh empty directory (it can read
-the run with `evokit log/show/diff/grep` but has no program to edit), given the objective, the
-task, the best version, the last 20 commits, the scores of the recent drafts, and a diff of what
-the agent is working on against the best:
+supervisor in the background and the count starts over. In the $5 runs, the agent improved every
+1 to 4 attempts for most of the run and plateaued for 5 to 10 near the end, so 5 fires at the
+plateau without interrupting steady progress. The supervisor is the same agent, in a fresh empty
+directory (it can read the run with `evokit log/show/diff/grep` but has no program to edit),
+given the objective, the task, the best version, the last 20 commits, the scores of the recent
+drafts, and a diff of what the agent is working on against the best:
 
 ```text
 - 3f2a9c1b07  score=2.61  rejected  SLSQP polish of the outer ring
@@ -217,62 +202,64 @@ evaluations), and its transcript at `sessions/<id>/agent.jsonl`. Per commit: `cr
 `evaluated` records with the agent's title and description as the version's name and description,
 so `evokit log` reads like a git log of the run.
 
-## What autoresearch is
+## How it differs from the paper and the open reproduction
 
-All of autoresearch is `program.md`: a prompt telling one agent to run, in one session:
+NVIDIA released no code, so the references are the paper and
+[gatordevin/avo](https://github.com/gatordevin/avo) at commit `f6dad9e`.
 
-```text
-LOOP FOREVER:
-1. Look at the git state: the current branch/commit we're on
-2. Tune train.py with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: uv run train.py > run.log 2>&1
-5. Read out the results: grep "^val_bpb:\|^peak_vram_mb:" run.log
-...
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
-```
+Versus the paper:
 
-- One conversation for the whole run: "do NOT pause to ask the human if you should continue."
-- Every run of the experiment is a recorded attempt (`results.tsv`: commit, val_bpb, memory,
-  keep/discard/crash, description). There are no drafts.
-- Keep only if strictly better. Equal or worse is reset.
-- The simplicity rule is the agent's judgment: "A 0.001 val_bpb improvement that adds 20 lines
-  of hacky code? Probably not worth it. ... An improvement of ~0 but much simpler code? Keep."
-- No supervisor, no knowledge base beyond the repo, and no lineage beyond the git branch.
+- **No knowledge base.** The paper gives the agent CUDA and PTX guides, Blackwell specs and
+  FlashAttention-4's source. Here the agent has `TASK.md` and the task's files.
+- **Lineage is evokit's history, not git.** The paper stores each committed version as a git
+  commit with its score. Here the agent reads the lineage with `evokit log`, `show`, `diff` and
+  `grep`. The workspace is a plain directory.
+- **Committing is an explicit command.** The paper describes the agent persisting a version once
+  it is satisfied. Here it calls `$EVOKIT_COMMIT`; drafts through `$EVOKIT_DRAFT_EVAL` are not
+  recorded.
+- **Rejected commits are recorded.** In the paper, failed attempts stay only in the agent's
+  trajectory. Here a rejected commit is in the run's history (`evokit log --all`), and the
+  workspace is left as it is: the prompt tells the agent to decide whether to go back to the best.
+- **Correctness is the evaluator's job.** The paper scores incorrect kernels as zero and
+  optimizes the geometric mean over a vector of benchmark configurations. Here there is no separate
+  correctness flag: `eval_fn` returns objectives, and a task makes incorrect programs score low or
+  fail.
+- **The stall rule and the supervisor are our choices.** The paper only says the supervisor
+  reviews the trajectory when progress stalls. The count (5 drafts and commits without a strictly
+  better score), running it in the background, using the same agent in an empty directory, and
+  what it is shown are evokit's decisions.
+- **It stops on money, not time.** The paper ran for 7 days. Here the limits are `max_cost`,
+  `max_evaluations` and `max_failures`; there is no wall-clock limit.
 
-### Where ours differs
+Versus gatordevin/avo:
 
-```python
-# evokit/recipes/autoresearch.py (now)
-"""... A fresh agent session makes each change."""
-operator = CodingAgentOperator(agent, project, instructions=instructions)   # persistent=False
-```
+- **A step is one agent run there, one commit here.** The reproduction's unattended loop runs the
+  agent once per step, then evaluates `work/` and accepts or rejects it. Each step starts a new
+  Claude process with no `--resume`; memory is `NOTES.md`, git history and the last rejection.
+  Here one resumed session can commit any number of times.
+- **Its default mode has no loop.** By default, the open Claude Code or Codex session is the
+  operator and calls the reproduction's MCP tools; the framework never calls a model. Its
+  `avo run --backend claude_cli` mode is the closest to this recipe.
+- **It provides a knowledge base and a lineage table.** It copies a `kb/` folder into the run and
+  puts its file index and a rendered lineage table into every prompt. Here the prompt has the
+  current best, and the agent runs `evokit log` itself.
+- **It reverts on reject.** A rejected step resets `work/` and saves the patch under `rejected/`.
+  Here the workspace is not reset.
+- **Its supervisor triggers sooner, and blocks.** It fires after 3 steps without a better score
+  (ties count as no progress), runs before the next step, and can use a different model. Here it
+  fires after 5 drafts and commits, runs in the background, and is always the same agent.
+- **It stops on time and steps.** Its limits are `max_steps` and `time_budget_s`. Here they are
+  money (with a live cost meter shared by the session and the supervisor), commits, and failed
+  sessions.
+- **It drafts in place.** Its `./avo-eval` scores `work/` as the agent left it. Here a draft is
+  scored in a copy, so the workspace is untouched.
+- **It ships more around the loop:** target folders with seeds, knowledge bases and evaluators,
+  baseline measurement at the start of a run, paper-style plots, `avo doctor`, and several agent
+  backends.
 
-| | autoresearch | evokit now |
-| --- | --- | --- |
-| memory | one conversation | a fresh session for every change |
-| what is kept | strictly better; simplicity is the agent's call | `SimplerBestArchive`: better, or tied and fewer lines |
-| who runs the experiment | the agent, then it reads the result | evokit, after the session ends |
-| `results.tsv` | written by the agent | written by the recipe (same columns minus memory) |
+The same in all three: `Vary(P_t) = Agent(P_t, K, f)` with the agent choosing what to read, edit
+and score; no default cap on scoring calls; the commit rule "correct, and matches or improves the
+best"; and a single lineage.
 
-The fresh session is the big one. In the original, the agent remembers every experiment it ran
-and why it failed; ours starts each change knowing only the current best.
-
-**The change (not made yet).** Autoresearch is AVO's commit loop with different settings: every
-evaluation is an attempt (no drafts), the commit rule is "strictly better", there is no
-supervisor, and the prompt is `program.md`'s, simplicity rule included. The line-count archive
-goes; the agent judges simplicity, as in the original.
-
-## The two, side by side
-
-With AVO's commit loop in place, autoresearch is the same loop with different settings, which is
-the honest comparison:
-
-| | autoresearch | AVO |
-| --- | --- | --- |
-| an evaluation is | an attempt | a draft, until the agent commits |
-| commit rule | strictly better | matches or improves |
-| lineage the agent reads | `evokit log` | `evokit log` |
-| supervisor | none | after 5 drafts and commits without a new best |
-| memory | one conversation | one conversation |
+[autoresearch](autoresearch.md) is the same single lineage with a fresh session per change, and
+with evokit running the evaluation instead of the agent.

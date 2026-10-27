@@ -23,7 +23,7 @@ from algorithms.common import arguments, seed_archive
 from algorithms.dgm.benchmark import INSTRUCTIONS, PackingBenchmark
 
 import evokit as ek
-from evokit import history, recipes
+from evokit import recipes
 from evokit.archives import LatestArchive, UnboundedArchive
 from evokit.files import Files
 from evokit.storages import DirectoryStorage
@@ -36,12 +36,13 @@ async def run(directory: str, variant: str = "full", workers: int = 4, max_child
     if variant not in VARIANTS:
         raise ValueError(f"variant must be one of {VARIANTS}")
     storage = DirectoryStorage(directory)
+    history = ek.History(storage)
     seed_agent = Files.from_directory(SEED_AGENT)
     eval_fn = PackingBenchmark(storage)
     archive = LatestArchive("score", storage=storage) if variant == "no-open-ended" else UnboundedArchive("score", storage=storage)
-    await seed_archive(storage, archive, seed_agent, eval_fn)
+    await seed_archive(history, archive, seed_agent, eval_fn)
     await recipes.dgm(
-        eval_fn, storage=storage, archive=archive, instructions=INSTRUCTIONS, workers=workers,
+        eval_fn, history=history, archive=archive, instructions=INSTRUCTIONS, workers=workers,
         max_children=max_children, max_cost=max_cost,
         fixed_agent=seed_agent if variant == "no-self-improve" else None,
         open_ended=variant not in ("no-open-ended", "greedy"),
@@ -51,7 +52,8 @@ async def run(directory: str, variant: str = "full", workers: int = 4, max_child
 
 def report(storage: ek.Storage, archive: ek.Archive) -> None:
     """Write the best agent, and the best packing any agent produced."""
-    counts, usage = history.counts(storage), history.usage(storage)
+    history = ek.History(storage)
+    counts, usage = history.counts(), history.usage()
     print(f"{counts['evaluated']} agents evaluated ({counts['added']} admitted), ${usage['cost_usd']:.2f}")
     best = archive.best()
     if best is None:
@@ -60,7 +62,7 @@ def report(storage: ek.Storage, archive: ek.Archive) -> None:
     with storage.local("best_agent") as folder:
         best.genome.write_to(folder)
     print(f"best agent: {best.id} score {best.objective('score'):.3f}")
-    solved = [i for i in history.evaluated(storage) if i.objective("best_sum_26") is not None and storage.exists(f"artifacts/{i.id}/best_main.py")]
+    solved = [i for i in history.evaluated() if i.objective("best_sum_26") is not None and storage.exists(f"artifacts/{i.id}/best_main.py")]
     if solved:
         top = max(solved, key=lambda i: i.objective("best_sum_26"))
         storage.write("best_main.py", storage.read(f"artifacts/{top.id}/best_main.py"))

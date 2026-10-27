@@ -14,7 +14,6 @@ import random
 from collections import Counter
 
 import evokit as ek
-from evokit import history
 from evokit.archives import BestArchive
 from evokit.operators import Choice
 from evokit.storages import MemoryStorage
@@ -45,7 +44,8 @@ def reset(rng: random.Random):
     return mutate
 
 
-def eval_fn(individual: ek.Individual, workdir) -> ek.Evaluation:
+@ek.eval_fn
+def score(individual: ek.Individual) -> ek.Evaluation:
     return ek.Evaluation({"score": rastrigin(individual.genome)})
 
 
@@ -53,21 +53,23 @@ async def main(evaluations: int = 5000) -> None:
     rng = random.Random(0)
     seed = [rng.uniform(-BOUND, BOUND) for _ in range(DIMENSIONS)]
     storage = MemoryStorage()
+    history = ek.History(storage)
     archive = BestArchive(storage=storage)
     operator = Choice(
         {"gaussian": ek.Mutate(gaussian(0.1, random.Random(1))), "reset": ek.Mutate(reset(random.Random(2)))}, seed=3
     )
     strategy = Greedy()
 
-    await ek.tell(storage, archive, await ek.evaluate(storage, [ek.Individual.new(seed, name="seed")], eval_fn=eval_fn))
-    while history.counts(storage)["evaluated"] < evaluations:
-        asked = await ek.ask(storage, archive, strategy, operator)
-        await ek.tell(storage, archive, await ek.evaluate(storage, asked.individuals, eval_fn=eval_fn))
+    first = ek.Individual.new(seed, name="seed")
+    await ek.tell(history, archive, [first], [await score(first)])
+    while history.counts()["evaluated"] < evaluations:
+        asked = await ek.ask(history, archive, strategy, operator)
+        await ek.tell(history, archive, asked.individuals, await asyncio.gather(*map(score, asked.individuals)))
 
     print(f"seed score: {rastrigin(seed):.3f}")
-    print(f"best score: {archive.best().objective('score'):.3f} after {history.counts(storage)['evaluated']} evaluations")
-    made = Counter(i.info.get("operator") for i in history.evaluated(storage) if i.parents)
-    kept = Counter(i.info.get("operator") for i in history.admitted(storage) if i.parents)
+    print(f"best score: {archive.best().objective('score'):.3f} after {history.counts()['evaluated']} evaluations")
+    made = Counter(i.info.get("operator") for i in history.evaluated() if i.parents)
+    kept = Counter(i.info.get("operator") for i in history.admitted() if i.parents)
     print("admission rate:", {name: f"{kept[name]}/{made[name]}" for name in made})
 
 

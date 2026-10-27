@@ -1,8 +1,7 @@
 # Reading a run
 
-**Status: implemented.** Replaces the git repository in [git-view.md](git-view.md): evokit has its
-own git-style read commands, which work for every genome type and every run. Agents can still use
-git in their own workspace.
+evokit has its own git-style read commands, which work for every genome type and every run.
+Agents can still use git in their own workspace.
 
 ## What a person or an agent needs
 

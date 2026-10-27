@@ -20,9 +20,9 @@ from typing import Mapping
 from algorithms.common import arguments, model, packing_task, report, seed_archive
 
 import evokit as ek
-from evokit import history, recipes
+from evokit import recipes
 from evokit.archives import IslandArchive
-from evokit.files import Files, ScriptEvaluator, with_lines
+from evokit.files import ScriptEvaluator, with_lines
 from evokit.recipes.dgm import staged_eval
 from evokit.storages import DirectoryStorage
 
@@ -31,19 +31,12 @@ ARCHIVE_SWAPS = {"one-island": {"islands": 1}, "no-grid": {"features": (), "cell
 RECIPE_SWAPS = {"no-inspirations": {"inspirations": 0}}
 
 
-def with_evolve_block(genome: Files) -> Files:
-    """Mark everything from construct_packing() on as editable; the docstring, imports and N stay."""
-    text = genome.text("main.py")
-    start = text.index("\ndef construct_packing")
-    return genome.with_files({"main.py": f"{text[:start]}\n# EVOLVE-BLOCK-START{text[start:]}# EVOLVE-BLOCK-END\n"})
-
-
 def cascade_evaluate(project):
     """Stage 1 runs evaluate.py with a 30 s limit: crashes and invalid packings fail cheaply.
-    Only programs that ran out of time get stage 2, the same check with a 10 minute limit.
+    Only programs that ran out of time get stage 2, the same check with the task's 5 minute limit.
     Adds `lines`, one of the grid's features."""
     quick = ScriptEvaluator(project, "python evaluate.py", timeout="30s")
-    full = ScriptEvaluator(project, "python evaluate.py", timeout="10m")
+    full = ScriptEvaluator(project, "python evaluate.py", timeout="5m")
     timed_out = lambda evaluation: not evaluation.objectives and "exceeded" in evaluation.feedback  # noqa: E731
     return with_lines(staged_eval(quick, full, promote=timed_out))
 
@@ -59,6 +52,7 @@ async def run(
     if variant not in VARIANTS:
         raise ValueError(f"variant must be one of {VARIANTS}")
     storage = DirectoryStorage(directory)
+    history = ek.History(storage)
     task = packing_task(storage)
     models = models or {
         "fast": model(os.environ.get("EVOKIT_FAST_MODEL", "claude-haiku-4-5")),
@@ -68,9 +62,9 @@ async def run(
         models = {"fast": models["fast"]}
     eval_fn = cascade_evaluate(task.project)
     archive = IslandArchive(storage=storage, **ARCHIVE_SWAPS.get(variant, {}))
-    await seed_archive(storage, archive, with_evolve_block(task.project.seed_genome()), eval_fn)
+    await seed_archive(history, archive, task.project.seed_genome(), eval_fn)
     await recipes.openevolve(
-        task.project, eval_fn, models, weights={"fast": 0.8, "strong": 0.2}, storage=storage, archive=archive,
+        task.project, eval_fn, models, weights={"fast": 0.8, "strong": 0.2}, history=history, archive=archive,
         instructions=task.instructions, workers=workers, max_evaluations=max_evaluations, max_cost=max_cost,
         **RECIPE_SWAPS.get(variant, {}),
     )
@@ -79,7 +73,7 @@ async def run(
 
 def print_curve(storage: ek.Storage, every: int = 25) -> None:
     best, points = None, []
-    evaluated = history.evaluated(storage)
+    evaluated = ek.History(storage).evaluated()
     for k, individual in enumerate(evaluated, 1):
         score = individual.objective("score")
         if score is not None and (best is None or score > best):

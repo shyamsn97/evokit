@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 
-from evokit import history
+from evokit.history import LOG
 from evokit.errors import UsageError
 from evokit.files.commands import FileCommands
 from evokit.interface.history import HistoryCommands
@@ -55,6 +55,6 @@ def open_setup(directory: str | Path, task: str | Path | None = None) -> Setup:
 
 def open_history(directory: str | Path) -> Setup:
     """The run in `directory`, for reading only: no task needed."""
-    if not (Path(directory) / history.LOG).is_file():
+    if not (Path(directory) / LOG).is_file():
         raise UsageError(f"no run in {Path(directory)}", hint="point --dir (or $EVOKIT_DIR) at a run directory")
     return Setup((HistoryCommands(DirectoryStorage(directory)),))

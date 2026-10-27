@@ -43,6 +43,10 @@ class Storage(ABC):
     def append(self, path: str, data: bytes) -> None:
         """Add `data` to the end of the file at `path`, creating it if needed. Safe for concurrent writers."""
 
+    def read_from(self, path: str, offset: int) -> bytes:
+        """The bytes of the file at `path` from `offset` on: how a log is followed without re-reading it."""
+        return self.read(path)[offset:]
+
     @abstractmethod
     def local(self, path: str) -> AbstractContextManager[Path]:
         """A real folder holding what is stored under `path`, for code that needs one. What is in the

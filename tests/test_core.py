@@ -1,6 +1,7 @@
 """The core: storage, history, archives, strategies, operators and ask/evaluate/tell, without files."""
 
 import asyncio
+import functools
 import json
 import math
 import os
@@ -9,7 +10,7 @@ import time
 import pytest
 
 import evokit as ek
-from evokit import history
+from evokit.history import History
 from evokit.archives import (
     BestArchive,
     IslandArchive,
@@ -25,11 +26,17 @@ from evokit.storages import DirectoryStorage, MemoryStorage
 from evokit.strategies import Greedy, IslandSampler, ProportionalSelection, Tournament
 
 
+@functools.cache
+def history_of(storage) -> History:
+    """One History per storage, as a process keeps one per run."""
+    return History(storage)
+
+
 def scored(genome, score, parents=(), **objectives):
     return ek.Individual.new(genome, list(parents)).with_evaluation(ek.Evaluation({"score": score, **objectives}))
 
 
-def closeness(individual, workdir):
+def closeness(individual):
     return ek.Evaluation({"score": -abs(individual.genome - 3)})
 
 
@@ -39,16 +46,16 @@ def bump(step=1.0):
 
 async def seeded(storage, archive, *genomes, eval_fn=closeness):
     seeds = [ek.Individual.new(g) for g in genomes]
-    await ek.tell(storage, archive, await ek.evaluate(storage, seeds, eval_fn=eval_fn))
+    await ek.tell(history_of(storage), archive, seeds, await asyncio.gather(*map(ek.as_eval_fn(eval_fn), seeds)))
     return archive
 
 
 async def loop(storage, archive, strategy, operator, evaluations, eval_fn=closeness):
-    while history.counts(storage)["evaluated"] < evaluations:
-        asked = await ek.ask(storage, archive, strategy, operator)
+    while history_of(storage).counts()["evaluated"] < evaluations:
+        asked = await ek.ask(history_of(storage), archive, strategy, operator)
         if asked.exhausted:
             return
-        await ek.tell(storage, archive, await ek.evaluate(storage, asked.individuals, eval_fn=eval_fn))
+        await ek.tell(history_of(storage), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(eval_fn), asked.individuals)))
 
 
 # records
@@ -116,11 +123,11 @@ def test_hill_climb_and_history_totals():
 
     archive = asyncio.run(go())
     assert archive.best().genome == 3.0
-    counts = history.counts(storage)
+    counts = history_of(storage).counts()
     assert counts["created"] == 4 and counts["evaluated"] == 5 and counts["added"] == 4
-    assert [i.genome for i in history.admitted(storage)] == [0.0, 1.0, 2.0, 3.0]
-    assert [r["kind"] for r in history.records(storage)][:3] == ["evaluated", "created", "evaluated"]
-    chain = history.admitted(storage)
+    assert [i.genome for i in history_of(storage).admitted()] == [0.0, 1.0, 2.0, 3.0]
+    assert [r["kind"] for r in history_of(storage).records()][:3] == ["evaluated", "created", "evaluated"]
+    chain = history_of(storage).admitted()
     assert all(later.parents == (earlier.id,) for earlier, later in zip(chain, chain[1:]))
 
 
@@ -128,18 +135,18 @@ def test_every_cost_is_in_the_history():
     storage = MemoryStorage()
     model = FunctionModel(lambda prompt: ek.operators.Completion("x", {"cost_usd": 0.25}))
 
-    def priced(individual, workdir):
+    def priced(individual):
         return ek.Evaluation({"score": len(individual.genome)}, usage={"cost_usd": 0.5})
 
     async def go():
         archive = await seeded(storage, BestArchive(storage=storage), "a", eval_fn=priced)
-        asked = await ek.ask(storage, archive, Greedy(), TextRewriteOperator(model))
-        await ek.tell(storage, archive, await ek.evaluate(storage, asked.individuals, eval_fn=priced))
-        history.note(storage, "judge", "a judge's verdict", {"cost_usd": 0.125})
+        asked = await ek.ask(history_of(storage), archive, Greedy(), TextRewriteOperator(model))
+        await ek.tell(history_of(storage), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(priced), asked.individuals)))
+        history_of(storage).note("judge", "a judge's verdict", {"cost_usd": 0.125})
 
     asyncio.run(go())
-    assert history.usage(storage)["cost_usd"] == pytest.approx(0.5 + 0.25 + 0.5 + 0.125)
-    assert history.last_note(storage, "judge") == "a judge's verdict" and history.counts(storage)["judge"] == 1
+    assert history_of(storage).usage()["cost_usd"] == pytest.approx(0.5 + 0.25 + 0.5 + 0.125)
+    assert history_of(storage).last_note("judge") == "a judge's verdict" and history_of(storage).counts()["judge"] == 1
 
 
 def test_operator_failures_and_exhausted():
@@ -151,16 +158,16 @@ def test_operator_failures_and_exhausted():
 
     async def go():
         archive = BestArchive(storage=storage)
-        empty = await ek.ask(storage, archive, Greedy(), Fails())
+        empty = await ek.ask(history_of(storage), archive, Greedy(), Fails())
         await seeded(storage, archive, 0.0)
-        failed = await ek.ask(storage, archive, Greedy(), Fails(), n=2)
+        failed = await ek.ask(history_of(storage), archive, Greedy(), Fails(), n=2)
         return empty, failed
 
     empty, failed = asyncio.run(go())
     assert empty.exhausted and not empty.individuals
     assert not failed.exhausted and not failed.individuals and [f.reason for f in failed.failures] == ["no idea"] * 2
     assert failed.failures[0].selection.parents[0].genome == 0.0
-    assert history.usage(storage)["cost_usd"] == 1.0 and history.counts(storage)["failed"] == 2
+    assert history_of(storage).usage()["cost_usd"] == 1.0 and history_of(storage).counts()["failed"] == 2
 
 
 def test_max_failures_stops_a_loop_that_only_fails():
@@ -173,8 +180,8 @@ def test_max_failures_stops_a_loop_that_only_fails():
     storage = MemoryStorage()
     archive = asyncio.run(seeded(storage, BestArchive(storage=storage), 0.0))
     RunCommands(storage, archive, Greedy(), Fails(), closeness).run(max_failures=3)
-    assert history.counts(storage)["failed"] == 3
-    assert history.last_note(storage, "stop") == "3 operator failures in a row; the last: Invalid API key"
+    assert history_of(storage).counts()["failed"] == 3
+    assert history_of(storage).last_note("stop") == "3 operator failures in a row; the last: Invalid API key"
 
 
 def test_failures_in_a_row_reset_when_a_child_is_created():
@@ -191,13 +198,13 @@ def test_failures_in_a_row_reset_when_a_child_is_created():
 
     async def go():
         archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        while not ek.Limits(max_evaluations=3, max_failures=3).reached(storage):
-            asked = await ek.ask(storage, archive, Greedy(), Flaky())
-            await ek.tell(storage, archive, await ek.evaluate(storage, asked.individuals, eval_fn=closeness))
+        while not ek.Limits(max_evaluations=3, max_failures=3).reached(history_of(storage)):
+            asked = await ek.ask(history_of(storage), archive, Greedy(), Flaky())
+            await ek.tell(history_of(storage), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(closeness), asked.individuals)))
 
     asyncio.run(go())
-    assert history.counts(storage)["evaluated"] == 3 and history.counts(storage)["failed"] == 4
-    assert history.failures_in_a_row(storage) == 0
+    assert history_of(storage).counts()["evaluated"] == 3 and history_of(storage).counts()["failed"] == 4
+    assert history_of(storage).failures_in_a_row() == 0
 
 
 def test_a_failing_check_stops_the_loop_before_it_starts():
@@ -212,10 +219,10 @@ def test_a_failing_check_stops_the_loop_before_it_starts():
 
     storage = MemoryStorage()
     archive = asyncio.run(seeded(storage, BestArchive(storage=storage), 0.0))
-    before = len(history.records(storage))
+    before = len(history_of(storage).records())
     with pytest.raises(ek.UsageError, match="no API key"):
         RunCommands(storage, archive, Greedy(), Choice({"a": NoKey()}), closeness).run()
-    assert len(history.records(storage)) == before
+    assert len(history_of(storage).records()) == before
 
 
 @pytest.mark.parametrize("backend", ["memory", "directory"])
@@ -235,51 +242,62 @@ def test_one_driver_at_a_time(tmp_path, backend):
         pass
 
 
-def test_evaluate_turns_crashes_and_timeouts_into_empty_evaluations():
-    storage = MemoryStorage()
+def test_eval_fn_decorator_makes_sync_and_async_functions_async():
+    @ek.eval_fn
+    def sync(individual):
+        return ek.Evaluation({"score": individual.genome})
 
-    def crash(individual, workdir):
+    @ek.eval_fn(timeout="1s")
+    async def coro(individual):
+        return ek.Evaluation({"score": individual.genome + 1})
+
+    async def go():
+        individual = ek.Individual.new(1)
+        return await sync(individual), await coro(individual)
+
+    assert [e.objectives["score"] for e in asyncio.run(go())] == [1, 2]
+    assert sync.__name__ == "sync" and sync.is_eval_fn
+
+
+def test_eval_fn_turns_crashes_and_timeouts_into_empty_evaluations():
+
+    def crash(individual):
         raise RuntimeError("boom")
 
-    async def slow(individual, workdir):
+    @ek.eval_fn(timeout=0.05)
+    async def slow(individual):
         await asyncio.sleep(5)
 
-    def wrong(individual, workdir):
+    def wrong(individual):
         return 1.0
 
     async def go():
-        individuals = [ek.Individual.new(0)]
-        return (
-            await ek.evaluate(storage, individuals, eval_fn=crash),
-            await ek.evaluate(storage, individuals, eval_fn=slow, timeout=0.05),
-            await ek.evaluate(storage, individuals, eval_fn=wrong),
-        )
+        individual = ek.Individual.new(0)
+        return [await ek.as_eval_fn(fn)(individual) for fn in (crash, slow, wrong)]
 
-    (crashed,), (timed_out,), (wrong_type,) = asyncio.run(go())
-    assert crashed.evaluation.objectives == {} and "boom" in crashed.evaluation.feedback
-    assert timed_out.evaluation.objectives == {} and "timed out" in timed_out.evaluation.feedback
-    assert "must return an Evaluation" in wrong_type.evaluation.feedback
-    assert not BestArchive().add(crashed)
+    crashed, timed_out, wrong_type = asyncio.run(go())
+    assert crashed.objectives == {} and "boom" in crashed.feedback
+    assert timed_out.objectives == {} and "timed out" in timed_out.feedback
+    assert "must return an Evaluation" in wrong_type.feedback
+    assert not BestArchive().add(ek.Individual.new(0).with_evaluation(crashed))
     with pytest.raises(ValueError):
-        asyncio.run(ek.tell(storage, BestArchive(), [ek.Individual.new(0)]))
+        asyncio.run(ek.tell(MemoryStorage(), BestArchive(), [ek.Individual.new(0)], []))
 
 
-def test_eval_fn_gets_its_artifact_folder(tmp_path):
+def test_tell_stores_evaluation_logs_in_the_artifact_folder(tmp_path):
     storage = DirectoryStorage(tmp_path / "run")
-
-    def write_log(individual, workdir):
-        (workdir / "log.txt").write_text(f"evaluated {individual.genome}")
-        return ek.Evaluation({"score": 1.0})
-
-    (individual,) = asyncio.run(ek.evaluate(storage, [ek.Individual.new(7)], eval_fn=write_log))
+    individual = ek.Individual.new(7)
+    evaluation = ek.Evaluation({"score": 1.0}, logs={"log.txt": b"evaluated 7"})
+    (admitted,) = asyncio.run(ek.tell(history_of(storage), BestArchive(storage=storage), [individual], [evaluation]))
     assert storage.read(f"artifacts/{individual.id}/log.txt") == b"evaluated 7"
+    assert admitted.evaluation.logs == {}
 
 
 def test_known_seed_skips_evaluate():
     storage = MemoryStorage()
     archive = BestArchive(storage=storage)
     seed = ek.Individual.new(1.0).with_evaluation(ek.Evaluation({"score": 0.52}))
-    assert asyncio.run(ek.tell(storage, archive, [seed])) == [seed] and archive.best() == seed
+    assert asyncio.run(ek.tell(history_of(storage), archive, [seed], [seed.evaluation])) == [seed] and archive.best() == seed
 
 
 def test_pending_children_survive_a_crash(tmp_path):
@@ -295,28 +313,28 @@ def test_pending_children_survive_a_crash(tmp_path):
 
     async def crash_before_evaluating():
         archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        return await ek.ask(storage, archive, Greedy(), Counting())
+        return await ek.ask(history_of(storage), archive, Greedy(), Counting())
 
     (child,) = asyncio.run(crash_before_evaluating()).individuals
-    assert [i.id for i in history.pending(storage)] == [child.id]
+    assert [i.id for i in history_of(storage).pending()] == [child.id]
 
     reopened = DirectoryStorage(path)  # a new process: its own history cache
 
     async def resume():
         archive = BestArchive(storage=reopened)
-        asked = await ek.ask(reopened, archive, Greedy(), Counting())
-        await ek.tell(reopened, archive, await ek.evaluate(reopened, asked.individuals, eval_fn=closeness))
+        asked = await ek.ask(history_of(reopened), archive, Greedy(), Counting())
+        await ek.tell(history_of(reopened), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(closeness), asked.individuals)))
         return asked
 
     asked = asyncio.run(resume())
     assert [i.id for i in asked.individuals] == [child.id] and made == [child.id]
-    assert history.usage(reopened)["cost_usd"] == 1.0 and not history.pending(reopened)
+    assert history_of(reopened).usage()["cost_usd"] == 1.0 and not history_of(reopened).pending()
 
 
 def test_concurrent_workers_overlap():
     storage = MemoryStorage()
 
-    async def slow(individual, workdir):
+    async def slow(individual):
         await asyncio.sleep(0.05)
         return ek.Evaluation({"score": individual.genome})
 
@@ -327,7 +345,7 @@ def test_concurrent_workers_overlap():
         return time.monotonic() - started
 
     assert asyncio.run(go()) < 0.05 * 8 * 0.75
-    assert history.counts(storage)["evaluated"] >= 9
+    assert history_of(storage).counts()["evaluated"] >= 9
 
 
 def test_discarded_children_are_not_pending():
@@ -335,11 +353,11 @@ def test_discarded_children_are_not_pending():
 
     async def go():
         archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        (child,) = (await ek.ask(storage, archive, Greedy(), bump())).individuals
-        history.discard(storage, child, "not novel")
+        (child,) = (await ek.ask(history_of(storage), archive, Greedy(), bump())).individuals
+        history_of(storage).discard(child, "not novel")
 
     asyncio.run(go())
-    assert not history.pending(storage) and history.counts(storage)["discarded"] == 1
+    assert not history_of(storage).pending() and history_of(storage).counts()["discarded"] == 1
 
 
 # archives
@@ -444,7 +462,7 @@ def test_choice_labels_children():
         await loop(storage, archive, Greedy(), operator, 20)
 
     asyncio.run(go())
-    assert {i.info["operator"] for i in history.evaluated(storage) if i.parents} == {"up", "down"}
+    assert {i.info["operator"] for i in history_of(storage).evaluated() if i.parents} == {"up", "down"}
 
 
 def test_text_operator_shows_inspirations():
@@ -472,7 +490,7 @@ def test_reading_a_run_like_git(tmp_path, capsys):
 
     storage = DirectoryStorage(tmp_path / "run")
 
-    def evaluate(individual, workdir):
+    def evaluate(individual):
         return ek.Evaluation({"score": -abs(individual.genome["x"] - 3)})
 
     async def go():
@@ -480,7 +498,7 @@ def test_reading_a_run_like_git(tmp_path, capsys):
         best = archive.best()
         better = ek.Individual.new({"x": 2}, [best.id], name="x to 2", description="closer")
         worse = ek.Individual.new({"x": 9}, [best.id], name="x to 9")
-        await ek.tell(storage, archive, await ek.evaluate(storage, [better, worse], eval_fn=evaluate))
+        await ek.tell(history_of(storage), archive, [better, worse], await asyncio.gather(*map(ek.as_eval_fn(evaluate), [better, worse])))
         return best, better, worse
 
     seed, better, worse = asyncio.run(go())
