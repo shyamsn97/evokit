@@ -1,5 +1,10 @@
 # DGM-Hyperagents
 
+!!! note "An implementation, not the official code"
+    This is EvoKit's version of the Hyperagents loop, not a port of
+    `facebookresearch/Hyperagents`; it ships no domains and no seed meta agent. See
+    [how it differs from the official code](#how-it-differs-from-the-official-code).
+
 [Hyperagents](https://arxiv.org/abs/2603.19461) (Zhang et al., 2026) removes the Darwin Gödel
 Machine's assumption that evaluation and self-modification are the same kind of task. In
 [DGM](dgm.md):
@@ -13,68 +18,47 @@ parent's meta agent edits a copy of the whole repository, its own code included.
 agents get improved evolves too, on any task. In the paper, the meta agent invented persistent
 memory and performance tracking for itself, and those improvements transferred across domains.
 
-In EvoKit this is DGM's loop with one different component: the operator.
+In EvoKit this is DGM's loop with one different variation function.
 
 ```python
 # evokit/recipes/hyperagents.py
-async def hyperagents(eval_fn, *, storage, archive, fixed_meta_agent=None, **dgm_options):
-    operator = MetaAgentModify(storage, fixed_meta_agent=fixed_meta_agent)
-    return await dgm(eval_fn, storage=storage, archive=archive, operator=operator, **dgm_options)
+async def hyperagents(task, *, fixed_meta_agent=None, **dgm_options):
+    modify = partial(meta_agent_modify, fixed_meta_agent=fixed_meta_agent, objective=task.objective)
+    return await dgm(task, modify=modify, **dgm_options)
 ```
 
 ```python
-# evokit/agents/meta_agent.py
-class MetaAgentModify(Operator):
-    """The genome is one repository: task_agent.py solves the task, meta_agent.py improves the repository.
-    The parent's meta agent edits a copy of the whole repository, itself included. With
-    `fixed_meta_agent`, that meta agent edits every parent instead (the ablation without
-    metacognitive self-modification)."""
-
-    name = "meta-agent"
-
-    def __init__(self, storage, *, entrypoint="meta_agent.py", logs="logs", fixed_meta_agent=None, timeout="30m"):
-        self.storage, self.entrypoint, self.logs = storage, entrypoint, logs
-        self.fixed_meta_agent, self.timeout = fixed_meta_agent, timeout
-
-    async def create(self, selection, archive) -> Offspring:
-        parent = selection.parents[0]
-        with tempfile.TemporaryDirectory(prefix="evokit-hyperagent-") as tmp, \
-                self.storage.local(f"artifacts/{parent.id}") as parent_artifacts:
-            root = Path(tmp)
-            parent.genome.write_to(root / "repo")
-            write_history(root / "history", archive, parent_artifacts / self.logs)
-            meta = root / "repo"
-            if self.fixed_meta_agent is not None:
-                meta = root / "meta"
-                self.fixed_meta_agent.write_to(meta)
-            argv = [sys.executable, str(meta / self.entrypoint), "--repo", str(root / "repo"), "--history", str(root / "history")]
-            result = await CommandAgent(argv, self.timeout).run("", cwd=root / "repo")
-            if result.error:
-                raise OperatorError(f"the meta agent failed: {result.error}", usage=result.usage)
-            child = Files.from_directory(root / "repo")
-        if child == parent.genome:
-            raise OperatorError("the meta agent changed nothing", usage=result.usage)
-        name, description = title_and_body(result.summary)
-        return Offspring((Individual.new(child, [parent.id], {"operator": self.name}, name=name, description=description),), result.usage)
-
-
-def write_history(directory, archive, parent_logs):
-    """What the meta agent can read: every archived agent's lineage and score, and the parent's logs."""
-    directory.mkdir()
-    with open(directory / "archive.jsonl", "w") as f:
-        for member in archive.members():
-            f.write(json.dumps({"id": member.id, "parents": member.parents,
-                                "score": member.evaluation.objectives.get("score"),
-                                "name": member.name, "description": member.description}) + "\n")
-    if parent_logs.is_dir():
-        shutil.copytree(parent_logs, directory / "parent_logs")
+# evokit/operators/meta_agent.py, condensed
+async def meta_agent_modify(parent, experiment, *, entrypoint="meta_agent.py", logs="logs",
+                            fixed_meta_agent=None, objective="score", timeout="30m"):
+    root = Path(tempfile.mkdtemp(prefix="evokit-hyperagent-"))
+    parent.genome.write_to(root / "repo")
+    with experiment.storage.local(f"artifacts/{parent.id}") as artifacts:
+        write_history(root / "history", experiment.archive, artifacts / logs, objective)
+    meta = root / "repo"                                   # the parent's own meta agent ...
+    if fixed_meta_agent is not None:
+        meta = root / "meta"                               # ... or a frozen one (the ablation)
+        fixed_meta_agent.write_to(meta)
+    argv = [sys.executable, str(meta / entrypoint), "--repo", str(root / "repo"), "--history", str(root / "history")]
+    async with CommandAgent(argv, timeout).session(root / "repo") as session:
+        result = await session.prompt("")
+    if result.error:
+        raise OperatorError(f"the meta agent failed: {result.error}", result.usage)
+    child = Files.from_directory(root / "repo")
+    if child == parent.genome:
+        raise OperatorError("the meta agent changed nothing", result.usage)
+    name, description = title_and_body(result.text)
+    return Individual.new(child, [parent.id], {"operator": "meta-agent"}, name=name, description=description), result.usage
 ```
+
+`write_history` gives the meta agent `history/archive.jsonl` (each archived agent's id,
+parents, score, name and description) and `history/parent_logs/` (the parent's evaluation logs).
 
 The pieces fit together like this:
 
 - **The seed** is a repository with `task_agent.py` and a minimal `meta_agent.py`. In the
   paper, the seed meta agent is an LLM with tools, told to modify any part of the codebase.
-- **`eval_fn`** runs `task_agent.py` on the domain's tasks, through
+- **The task's `evaluate`** runs `task_agent.py` on the domain's tasks, through
   `script_agent(..., entrypoint="task_agent.py")`. It returns logs under `logs/` (`Evaluation.logs`), where the
   next meta agent will read them.
 - **Memory comes for free.** A meta agent can only remember across generations by writing files
@@ -91,8 +75,8 @@ commit `59a68f6`:
 
 - **A loop, not a system.** The official repository is the whole pipeline: domains with
   train/val/test splits, Docker, an ensemble step, baselines and analysis. This recipe is DGM's loop
-  with `MetaAgentModify` as the operator. The caller brings the seed repository, `eval_fn` and the
-  archive, and evokit ships no domains and no seed meta agent.
+  with `meta_agent_modify` as the variation. The caller brings the task (the seed repository and
+  its `evaluate`), and EvoKit ships no domains and no seed meta agent.
 - **Full copies instead of patches.** The official loop applies the chain of ancestor patches to
   the initial repository, runs the meta agent in a git worktree, resets `domains/`, and saves the
   child as a diff. Here the parent's files are written to a temporary directory, and the edited
@@ -122,13 +106,13 @@ commit `59a68f6`:
   picks the subsets and the threshold.
 - **One domain at a time.** The official loop evaluates several domains in parallel, averages them
   for selection, and supports resetting the task or meta agent and transfer from another run's
-  archive. Here there is one `eval_fn`.
+  archive. Here there is one task `evaluate`.
 - **No ensemble and no held-out test.** The official loop can build an ensemble from the archive
   (the best agent per task), evaluate it on train, val and test, and evaluate on held-out test
   splits (`--eval_test`). Neither exists here.
 - **Different failure bookkeeping.** The official archive takes every generation and marks bad ones
   `valid_parent: false`, and a failed meta-agent run marks the *parent* invalid. Here only children
-  with a score enter the archive, and a failed meta-agent run is an operator error that counts
+  with a score enter the archive, and a failed meta-agent run is a `failed` note that counts
   toward `max_failures`.
 - **Ablations are mapped, not copied.** The official "no self-improvement" ablation runs the meta
   agent from a frozen copy while the genome evolves; here `fixed_meta_agent` does the same job. The

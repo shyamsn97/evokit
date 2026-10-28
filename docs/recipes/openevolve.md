@@ -1,5 +1,9 @@
 # OpenEvolve
 
+!!! note "An implementation, not the official code"
+    This is EvoKit's version of OpenEvolve's loop, not a port of `codelion/openevolve`. See
+    [how it differs from the official code](#how-it-differs-from-the-official-code).
+
 [OpenEvolve](https://github.com/codelion/openevolve) is an open AlphaEvolve. It has three parts:
 
 - **Islands of MAP-Elites grids.** The default features are code length and diversity.
@@ -9,38 +13,42 @@
 
 ```python
 # evokit/recipes/openevolve.py
-async def openevolve(project, eval_fn, models, weights=None, *, storage, archive, inspirations=4,
+async def openevolve(task, models, weights=None, *, dir=None, archive=None, inspirations=4,
                      migrate_every=20, migrate_top=2, workers=4, max_evaluations=1000,
-                     max_cost=None, seed=0):
-    strategy = IslandSampler(inspirations=inspirations, seed=seed)
-    operator = Choice({name: DiffOperator(model, project) for name, model in models.items()},
-                      weights=weights, seed=seed)
+                     max_cost=None, seed=None):
+    task = replace(task, evaluate=with_lines(task.evaluate))          # for a Files genome
+    archive = archive or IslandArchive(seed=seed or 0)                # 4 islands, ("lines", "diversity")
+    experiment = task.create_experiment(dir, archive=archive, max_evaluations=max_evaluations, max_cost=max_cost)
+    strategy = islands()
 
     async def worker():
-        while not done():                                 # max_evaluations or max_cost, from the history
-            asked = await evokit.ask(storage, archive, strategy, operator)
-            if asked.exhausted:
+        while not experiment.limits.reached():
+            parent, *others = archive.sample(1 + inspirations, strategy) or [None]
+            if parent is None:
                 return
-            evaluations = await asyncio.gather(*map(score, asked.individuals))
-            before = history.counts(storage)["evaluated"]
-            await evokit.tell(storage, archive, asked.individuals, evaluations)
-            if before // migrate_every < history.counts(storage)["evaluated"] // migrate_every:
+            name = archive.rng.choices(list(models), odds)[0]        # the weighted ensemble
+            if child := await experiment.create(diff(models[name], parent, others, task=task)):
+                await experiment.submit(child.with_info(operator=name))
+            if experiment.since_note("migrate") >= migrate_every:
+                experiment.note("migrate")
                 archive.migrate(top=migrate_top)
 
     await asyncio.gather(*(worker() for _ in range(workers)))
-    return archive.best()
+    return experiment.best()
 ```
 
 ```python
-storage = DirectoryStorage("runs/packing")
-archive = IslandArchive(islands=4, features=("lines", "diversity"), bins=10, storage=storage)
-await recipes.openevolve(project, eval_fn, models, storage=storage, archive=archive)
+models = {
+    "fast": AnthropicModel("claude-haiku-4-5", price=(1.0, 5.0)),      # USD per million tokens in, out
+    "strong": AnthropicModel("claude-sonnet-4-5", price=(3.0, 15.0)),
+}
+best = await recipes.openevolve(task, models, {"fast": 0.8, "strong": 0.2}, dir="experiments/oe-0")
 ```
 
 OpenEvolve's cascade evaluation (a quick test, then the full one for programs that pass) is
-part of the `eval_fn` the caller passes, like the Darwin Gödel Machine's
-[`staged_eval`](dgm.md). Migration is counted from the storage, so a continued run keeps the
-same schedule.
+part of the task's `evaluate`, like the Darwin Gödel Machine's [`staged_eval`](dgm.md).
+Migration is scheduled by `migrate` notes in the experiment, so a continued run keeps the same
+schedule.
 
 ## How it differs from the official code
 
@@ -73,7 +81,8 @@ and its `configs/default_config.yaml`:
   grid displacement removes members.
 - **Cascade evaluation is the caller's.** OpenEvolve calls `evaluate_stage1/2/3` with thresholds
   0.5, 0.75 and 0.9, retries failed evaluations up to 3 times, and times out at 300 s. Here the
-  caller passes a staged `eval_fn`; the circle-packing example promotes on a timeout, not a score.
+  task's `evaluate` does any staging; the circle-packing example promotes on a timeout, not a
+  score.
 - **Diffs only.** OpenEvolve can switch to full rewrites (`diff_based_evolution: false`) and
   rejects programs over 10,000 characters. This recipe always asks for diffs and has no size
   limit.
@@ -81,10 +90,11 @@ and its `configs/default_config.yaml`:
   `enforce_evolve_blocks` is set, and then reverts edits outside them. Here a child that edits
   outside the markers is refused.
 - **One process.** OpenEvolve runs each iteration (LLM call, diff, evaluation) in a process pool
-  of 4. Here 4 asyncio workers share one process, and evaluations run in threads.
+  of 4. Here 4 asyncio workers share one process, and evaluations run as subprocesses (or
+  threads, for a Python `evaluate`).
 - **No LLM feedback, artifacts, checkpoints or prompt logs.** OpenEvolve can add an LLM's score to
   the evaluation (weight 0.1), feed evaluator artifacts back into prompts, checkpoint every 10
-  iterations, and log every prompt. The run's storage is the only persistence here.
+  iterations, and log every prompt. The experiment's directory is the only persistence here.
 - **It stops on evaluations or cost.** OpenEvolve stops after `max_iterations` (100 in the
   default config) or at a target score. Here: `max_evaluations` (default 1,000) or `max_cost`.
 

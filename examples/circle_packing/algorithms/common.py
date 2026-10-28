@@ -64,6 +64,8 @@ def arguments(description: str, variants=(), **defaults) -> argparse.Namespace:
     parser.add_argument("--max-evaluations", type=int, default=defaults.get("max_evaluations"))
     parser.add_argument("--max-cost", type=float, default=defaults.get("max_cost", 5.0), help="US dollars")
     parser.add_argument("--agent", default="claude", help="coding agent: claude, or repl:MODEL (e.g. repl:gpt-5-mini)")
+    if "generations" in defaults:
+        parser.add_argument("--generations", type=int, default=defaults["generations"])
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="evokit: %(message)s")
     return parser.parse_args()
 

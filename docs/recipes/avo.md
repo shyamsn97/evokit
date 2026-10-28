@@ -1,5 +1,9 @@
 # AVO
 
+!!! note "An implementation, not the official code"
+    NVIDIA released no code for AVO; this is EvoKit's reading of the paper. See
+    [how it differs from the paper and the open reproduction](#how-it-differs-from-the-paper-and-the-open-reproduction).
+
 *AVO: Agentic Variation Operators for Autonomous Evolutionary Search* (Chen, Ye, Xu et al.,
 NVIDIA, 2026, [arXiv:2603.24517](https://arxiv.org/abs/2603.24517);
 [blog post](https://developer.nvidia.com/blog/nvidia-avo-reaches-100-on-arc-agi-3-demonstrating-a-frontier-level-general-purpose-architecture-for-long-horizon-autonomous-agents/)).
@@ -53,33 +57,33 @@ The agent gets exactly those three things and decides everything else:
 | lineage P_t | the `log`, `show`, `diff` and `grep` tools over the run ([reading a run](../reading-runs.md)) |
 | knowledge base K | not modeled: `TASK.md` and the task's files; agents can leave notes for later with `remember` |
 | the agent calls f | the `score` tool, no limit by default; it records the draft's score, nothing else |
-| the agent commits | the `submit` tool: recorded, evaluated and told at once; the reply is the verdict |
-| commit rule | `BestArchive(ties="accept")`, and an `eval_fn` that fails incorrect programs |
+| the agent commits | the `submit` tool: recorded, evaluated and offered to the archive at once; the reply is the verdict |
+| commit rule | `BestArchive(ties="accept")`, and a task `evaluate` that fails incorrect programs |
 | memory | one agent session for the run, prompted again with "Continue the loop" when a turn ends |
-| continuous loop | the session runs until `limits` are reached |
-| supervisor | after `stall_after=5` drafts and submissions without a strictly better score, another agent (`reviewer`, by default the same one) reviews the run in an empty directory and names 3 to 5 directions |
-| single lineage | every submission's parent is the archive's best |
+| continuous loop | the session runs until the experiment's limits are reached |
+| supervisor | after `stall_after=5` drafts and submissions without a strictly better score, another agent (`reviewer`, by default a fresh copy of the same one) reviews the run with read-only tools and names 3 to 5 directions |
+| single lineage | every submission's parent is the last version the archive kept |
 
 ### The loop
 
-The whole recipe is one session and a loop over its events. The session is opened on the run, in
-a checkout of the best version, with the `eval_fn`, the archive and the limits, and that is all
-it needs: from them it gives the agent its tools (the read tools and `remember`, `score`, and
-`submit`), records every turn in the run, sets each turn's budget, and stops the agent once a
-limit is reached. What is left is AVO's own policy:
+The whole recipe is one conversation and a loop over its events. `experiment.start(agent)` opens
+the conversation in a checkout of the best version, and from the experiment it gives the agent
+its tools (the read tools and `remember`, `score`, and `submit`), records every turn, sets each
+turn's budget, and stops the agent once a limit is reached. What is left is AVO's own policy:
 
 ```python
-checkout = project.checkout(best.genome, project.scratch / "agent")
-async with agent.session(checkout, run=run, eval_fn=eval_fn, archive=archive, limits=limits, resume=resume) as session:
-    while not limits.reached(run):
-        async for event in session.prompt(text):
-            stalled = stall_after and min(run.since_improvement(), run.since_note("review")) >= stall_after
-            if stalled and (review is None or review.done()):
-                run.note("review")
-                review = asyncio.ensure_future(supervise(reviewer or agent, session, run, limits, instructions))
+experiment = task.create_experiment(dir, archive=BestArchive(ties="accept"), max_cost=max_cost, ...)
+async with experiment.start(agent, resume=resume):
+    prompt = PROMPT.format(best=describe_individual(experiment.best()))
+    while not experiment.limits.reached():
+        async for event in agent.prompt(prompt):
+            if stalled(experiment, stall_after):
+                experiment.note("review")
+                if directions := await review(experiment, reviewer or agent.fresh()):
+                    agent.send(directions)
             if isinstance(event, Turn) and "submit" not in event.calls and not event.stopped:
-                run.note("failed", event.error or "the agent's turn ended without submitting anything")
-        text = CONTINUE.format(best=brief(archive.best()))
+                experiment.note("failed", event.error or "the agent's turn ended without submitting anything")
+        prompt = CONTINUE.format(best=brief(experiment.best()))
 ```
 
 The tools reach a shell agent as an `evokit` command on its PATH (`evokit submit "title"
@@ -93,10 +97,10 @@ version"). The agent sees, for example:
 
 ### Limits
 
-`limits` is a `Limits`: `max_evaluations` (submissions and the seed), `max_cost`, `max_failures`
-(turns in a row that submit nothing, so an agent that never submits cannot run forever), and any
-`stop` rules over the run, e.g. a cap on drafts: `lambda run: "200 drafts" if len(run.drafts()) >= 200 else None`.
-The session checks them in three places:
+The experiment's limits are `max_evaluations` (submissions and the seed), `max_cost` (default
+$5), and `max_failures` (turns in a row that submit nothing, so an agent that never submits
+cannot run forever). A copy of the recipe can add `stop` rules, e.g. a cap on drafts:
+`lambda e: "200 drafts" if len(e.drafts()) >= 200 else None`. They are checked in three places:
 
 - **Every tool call.** Once a limit is reached, the reply carries `"stop": reason`, further calls
   are refused, and the turn is interrupted `STOP_GRACE` (60 s) later if the agent keeps going.
@@ -109,30 +113,30 @@ and one review spend before their own budgets stop them.
 
 ### The supervisor
 
-A stall is counted by the run itself: `run.since_improvement()` counts attempts, every draft and
-every submission, since the best strictly improved, and `run.since_note("review")` counts them
-since the last review. Counting submissions alone does not work: the agent submits only versions
+A stall is counted by the experiment itself: `experiment.since_improvement()` counts attempts,
+every draft and every submission, since the best strictly improved, and
+`experiment.since_note("review")` counts them since the last review. Counting submissions alone does not work: the agent submits only versions
 its drafts showed were better, so in a real run all 9 submissions improved while the agent
 drafted the same score over and over. Ties are kept, so counting rejections would miss a plateau too.
 
-After `stall_after` attempts (default 5; `None` turns it off), the recipe starts the reviewer in
-the background. In the $5 runs, the agent improved every 1 to 4 attempts for most of the run and
-plateaued for 5 to 10 near the end, so 5 fires at the plateau without interrupting steady
-progress. The reviewer gets a session of its own on the run, so it has the read tools and an empty
-directory, and its prompt tells it how to review with them: `stats` for the best version,
-`log --all` for every submission and its score, `show` and `diff` for what each changed,
-`notes draft` for the drafts' scores, and `notes` for what agents learned. It replies with 3 to 5
-directions that differ from what was tried. Unlike the version before, it does not see the
-agent's unsubmitted edits.
+After `stall_after` attempts (default 5; `None` turns it off), the recipe calls the reviewer. In
+the $5 runs, the agent improved every 1 to 4 attempts for most of the run and plateaued for 5 to
+10 near the end, so 5 fires at the plateau without interrupting steady progress. The reviewer is
+`reviewer`, or `agent.fresh()`: a conversation of its own with only the read tools, in an empty
+directory. Its prompt tells it how to review with them: `stats` for the best version, `log --all`
+for every submission and its score, `show` and `diff` for what each changed, `notes draft` for
+the drafts' scores, and `notes` for what agents learned. It replies with 3 to 5 directions that
+differ from what was tried, through its `finish` tool. It does not see the agent's unsubmitted
+edits.
 
-It runs in the background because a tool reply cannot wait minutes (harnesses time out shell
-commands). Its answer is sent to the agent with `session.send`, which delivers it once: with the
-agent's next tool reply as `"message"`, or with the next prompt.
+The review runs between the agent's steps: while it runs, the agent is waiting for the reply to
+the tool call that triggered it. The directions are sent with `agent.send`, which delivers them
+once: with that tool reply as `"message"`, or with the next prompt.
 
 ### Records
 
-The session records every turn, the agent's and the reviewer's: a `turn` note (the reply, its
-cost, the tools it called, and why it stopped, if it was stopped) and its transcript under
+Every turn is recorded, the agent's and the reviewer's: a `turn` note (the reply, its cost, the
+tools it called, and why it stopped, if it was stopped) and its transcript under
 `sessions/<session id>/`. Per submission: `created` and `evaluated` records with the agent's
 title and description as the version's name and description, so `evokit log` reads like a git
 log of the run.
@@ -156,14 +160,15 @@ Versus the paper:
   workspace is left as it is: the prompt tells the agent to decide whether to go back to the best.
 - **Correctness is the evaluator's job.** The paper scores incorrect kernels as zero and
   optimizes the geometric mean over a vector of benchmark configurations. Here there is no separate
-  correctness flag: `eval_fn` returns objectives, and a task makes incorrect programs score low or
-  fail.
+  correctness flag: the task's `evaluate` returns objectives, and a task makes incorrect programs
+  score low or fail.
 - **The stall rule and the supervisor are our choices.** The paper only says the supervisor
-  reviews the trajectory when progress stalls. The count (5 drafts and submissions without a strictly
-  better score), running it in the background, in an empty directory, and what it is shown are
-  evokit's decisions.
+  reviews the trajectory when progress stalls. The count (5 drafts and submissions without a
+  strictly better score), the read-only conversation in an empty directory, and what it is shown
+  are EvoKit's decisions.
 - **It stops on money, not time.** The paper ran for 7 days. Here the limits are `max_cost`,
-  `max_evaluations`, `max_failures` and any stop rule (a wall-clock limit is `run.elapsed()`).
+  `max_evaluations`, `max_failures` and any stop rule (a wall-clock limit is
+  `experiment.elapsed()`).
 
 Versus gatordevin/avo:
 
@@ -179,10 +184,10 @@ Versus gatordevin/avo:
   current best, and the agent runs `evokit log` itself.
 - **It reverts on reject.** A rejected step resets `work/` and saves the patch under `rejected/`.
   Here the workspace is not reset.
-- **Its supervisor triggers sooner, and blocks.** It fires after 3 steps without a better score
-  (ties count as no progress), runs before the next step, and can use a different model. Here it
-  fires after 5 drafts and submissions, runs in the background, and is the same agent unless
-  `reviewer` is given.
+- **Its supervisor triggers sooner.** It fires after 3 steps without a better score (ties count
+  as no progress), runs before the next step, and can use a different model. Here it fires after
+  5 drafts and submissions, runs between the agent's tool calls, and is a fresh copy of the same
+  agent unless `reviewer` is given.
 - **It stops on time and steps.** Its limits are `max_steps` and `time_budget_s`. Here they are
   money, evaluations, failed turns, and any stop rule.
 - **It drafts in place.** Its `./avo-eval` scores `work/` as the agent left it. Here a draft is
@@ -196,4 +201,4 @@ and score; no default cap on scoring calls; the commit rule "correct, and matche
 best"; and a single lineage.
 
 [autoresearch](autoresearch.md) is the same single lineage with a fresh session per change, and
-with evokit running the evaluation instead of the agent.
+with EvoKit submitting what each session leaves instead of the agent.

@@ -1,5 +1,9 @@
 # autoresearch
 
+!!! note "An implementation, not the official code"
+    This is EvoKit's version of autoresearch, not a port of `program.md`. See
+    [how it differs from the official code](#how-it-differs-from-the-official-code).
+
 [autoresearch](https://github.com/karpathy/autoresearch) (Karpathy, 2026) is one lineage. All of
 the original is `program.md`, a prompt telling one agent to run, in one session:
 
@@ -25,35 +29,36 @@ LOOP FOREVER:
 
 ## The recipe
 
-`evokit/recipes/autoresearch.py` is the same single lineage with evokit doing the bookkeeping. A
-fresh agent session makes each change, evokit evaluates it, and the archive decides what is kept.
+`evokit/recipes/autoresearch.py` is the same single lineage with EvoKit doing the bookkeeping. A
+fresh agent session makes each change from the best version, EvoKit evaluates it, and the
+archive decides what is kept.
 
 ```python
-async def autoresearch(project, eval_fn, agent, *, storage, archive, instructions=None,
-                       objective="val_bpb", results="results.tsv", max_evaluations=None,
-                       max_cost=None, max_failures=10):
-    strategy = Greedy()
-    operator = CodingAgentOperator(agent, project, instructions=instructions)
-    while not stop_reason():                              # max_evaluations, max_cost, or max_failures in a row
-        asked = await evokit.ask(storage, archive, strategy, operator)
-        evaluations = await asyncio.gather(*map(score, asked.individuals))
-        admitted = await evokit.tell(storage, archive, asked.individuals, evaluations)
-        for child in evaluated:                           # one TSV row: id, objective, keep/discard/crash, name
-            tsv.write(row(child, status, objective))
-    return archive.best()
+async def autoresearch(task, agent, *, dir=None, archive=None, max_cost=None, max_evaluations=None):
+    if task.files is not None:
+        task = replace(task, evaluate=with_lines(task.evaluate))     # adds a "lines" objective
+    archive = archive or SimplerBestArchive(size="lines")
+    experiment = task.create_experiment(dir, archive=archive, max_cost=max_cost, max_evaluations=max_evaluations)
+    while not experiment.limits.reached():
+        parent = archive.top(1)[0]
+        async with experiment.start(agent, start=parent, submit=False) as directory:
+            turn = await agent.prompt(CHANGE, output=Change)         # "make one change; score it"
+            genome = task.read(directory)
+        if genome == parent.genome:
+            experiment.note("failed", "the agent made no changes")
+            continue
+        child = Individual.new(genome, [parent.id], name=turn.output.title, ...)
+        child = await experiment.submit(child)
+        experiment.storage.append("results.tsv", row(child, status, task.objective))   # keep / discard / crash
+    return experiment.best()
 ```
 
-```python
-project = Project(".", genome=["train.py"])
-eval_fn = with_lines(ScriptEvaluator(project, "uv run train.py", timeout="10m"))
-storage = DirectoryStorage("runs/mar5")
-archive = SimplerBestArchive(objective="val_bpb", minimize=True, size="lines", storage=storage)
-if not archive.members():
-    seed = Individual.new(project.seed_genome())
-    await evokit.tell(storage, archive, [seed], [await evokit.as_eval_fn(eval_fn)(seed)])
+The task is a folder whose `TASK.md` plays the part of `program.md`:
 
-await recipes.autoresearch(project, eval_fn, ClaudeCode(), storage=storage, archive=archive,
-                           instructions=open("program.md").read())
+```python
+task = ek.Task.from_directory("nanochat")     # config.yaml: genome [train.py], evaluate "uv run train.py",
+                                              # objective val_bpb, minimize true
+best = await recipes.autoresearch(task, ek.ClaudeCode(), dir="experiments/mar5", max_cost=20)
 ```
 
 ## How it differs from the official code
@@ -63,15 +68,16 @@ Compared with [karpathy/autoresearch](https://github.com/karpathy/autoresearch) 
 
 - **One conversation versus a fresh session per change.** The original agent runs every
   experiment in one session and remembers what it tried and why it failed. This recipe starts a
-  new session for each change (`CodingAgentOperator` with `persistent=False`), told only the
-  current best's score and feedback. With a `DirectoryStorage`, the agent can read the earlier
-  attempts with `evokit log`, `show`, `diff` and `grep`, but only if it chooses to.
-- **The agent does not run the experiment.** In the original, the agent runs
-  `uv run train.py > run.log`, reads `val_bpb` out of the log, and decides. Here the agent only
-  edits; evokit runs `eval_fn` after the session ends. The recipe gives the agent no draft
-  evaluation, so it cannot test a change before handing it back.
-- **No fix-and-retry on a crash.** The original agent reads `tail -n 50 run.log`, fixes typos
-  and simple bugs in place, and gives up after a few tries. Here a crash is logged as `crash`, and
+  new session for each change, in a checkout of the current best. The agent can read the earlier
+  attempts with the `log`, `show`, `diff`, `grep` and `notes` tools, but only if it chooses to.
+- **The agent scores drafts; EvoKit records the result.** In the original, the agent runs
+  `uv run train.py > run.log`, reads `val_bpb` out of the log, and decides what to keep. Here
+  the agent scores its edits with the `score` tool (the task's evaluator, recorded as a draft and
+  never kept), and is told to put back the best version it measured. After the session ends,
+  EvoKit evaluates what the agent left and the archive decides.
+- **Fix-and-retry happens only inside a session.** The original agent reads `tail -n 50 run.log`,
+  fixes typos and simple bugs in place, and gives up after a few tries. Here the agent can do the
+  same with drafts, but once its session ends, a version that crashes is logged as `crash`, and
   the next change starts a new session from the best version.
 - **The keep rule is mechanical.** The original keeps a commit only if `val_bpb` went down, and
   otherwise `git reset`s. Simplicity is left to the agent's judgment ("an improvement of ~0 but
@@ -81,14 +87,14 @@ Compared with [karpathy/autoresearch](https://github.com/karpathy/autoresearch) 
   Here every version, kept or not, is in the run's history, and the next parent is the archive's
   best.
 - **It stops.** The original says never stop until the human interrupts. This recipe stops at
-  `max_evaluations`, `max_cost`, or `max_failures` (default 10) sessions in a row that change
-  nothing.
+  `max_evaluations`, `max_cost`, or 10 sessions in a row that change nothing. Limits are checked
+  between changes, so the last change can go over.
 - **`results.tsv` has different columns.** The original's agent writes
   `commit, val_bpb, memory_gb, status, description` with a header and keeps it out of git. This
   recipe appends `id, objective, status, name` with no header and no memory column.
 - **No setup ritual.** The original has the agent pick a run tag, create the branch, read the
   files, check the data cache, write the TSV header, confirm with the human, and run the
-  unmodified `train.py` first. Here the caller seeds the archive by evaluating the seed program,
+  unmodified `train.py` first. Here `create_experiment` evaluates the task's files as the seed,
   and the loop starts.
 - **Peak VRAM is not tracked.** The original reports it and treats it as a soft constraint.
 
@@ -99,5 +105,6 @@ logged with keep, discard or crash, and the agent working unattended.
 and commits itself.
 
 With an outside agent there is no loop at all. The task is a folder ([tasks](../tasks.md)), and
-the agent calls the same functions: `evokit select-individuals` prints the parent's selection,
-and `evokit evaluate-directory DIR --parent ID` records, evaluates and tells the agent's program.
+the agent calls the same functions from the shell: `evokit list-individuals` and
+`evokit checkout-individual ID DIR` give it the parent, and
+`evokit evaluate-directory DIR --parent ID` evaluates its program and offers it to the archive.

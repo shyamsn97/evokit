@@ -3,6 +3,18 @@
 A small library for evolutionary search where the variation operator can be a one-shot
 LLM call, a headless coding agent, or the coding agent you are talking to.
 
+> **Status: work in progress.** EvoKit is early research code. The API changes often, without
+> deprecations, and the on-disk experiment format may change between commits. Pin a commit if you
+> depend on it.
+>
+> **The recipes are implementations, not official ports.** Each recipe (AVO, OpenEvolve,
+> ShinkaEvolve, the Darwin Gödel Machine, ...) is EvoKit's reading of the published algorithm,
+> written from the paper and, where there is one, the official code. None of them is a one-to-one
+> reproduction: prompts, defaults, selection details, budgets and infrastructure differ, and
+> several features of the originals are left out. Each recipe's page lists how it differs from
+> the original. Results from a recipe are results of EvoKit's version, not of the original
+> method, and should not be reported as reproductions of the paper.
+
 A `Task` says what evolves and how it is scored; an `Experiment` is one search on it, kept in a
 directory; a recipe is a plain async function that takes the task and every component, creates
 the experiment, and loops: pick individuals from the archive, make a child, submit it.
@@ -116,9 +128,24 @@ best = await recipes.avo(task, ek.ClaudeCode(), dir="experiments/avo-0", max_cos
 best = await recipes.openevolve(task, {"fast": fast_model, "strong": strong_model}, dir="experiments/oe-0")
 ```
 
-The recipes are `autoresearch`, `avo`, `openevolve`, `shinka`, `dgm` (with `staged_eval`),
-`hyperagents` and `ga`, one file each in `evokit/recipes/`. Each takes the task first and its
-components and options as keyword arguments. To change one, copy it.
+Each recipe is one file in `evokit/recipes/`. It takes the task first and its components and
+options as keyword arguments. To change one, copy it.
+
+| Recipe | Based on | What it is | How it differs |
+| --- | --- | --- | --- |
+| `autoresearch` | [karpathy/autoresearch](https://github.com/karpathy/autoresearch) | one lineage; a fresh agent session per change; keep if better, or tied and shorter | [docs](docs/recipes/autoresearch.md#how-it-differs-from-the-official-code) |
+| `avo` | [AVO](https://arxiv.org/abs/2603.24517) (NVIDIA; no official code) | one persistent agent session that scores drafts and submits versions, with a supervisor on stalls | [docs](docs/recipes/avo.md#how-it-differs-from-the-paper-and-the-open-reproduction) |
+| `openevolve` | [codelion/openevolve](https://github.com/codelion/openevolve) (an open AlphaEvolve) | islands of MAP-Elites grids, inspirations, an LLM ensemble writing diffs | [docs](docs/recipes/openevolve.md#how-it-differs-from-the-official-code) |
+| `shinka` | [SakanaAI/ShinkaEvolve](https://github.com/SakanaAI/ShinkaEvolve) | islands, child-discounted parents, a bandit over LLMs, novelty rejection | [docs](docs/recipes/shinka.md#how-it-differs-from-the-official-code) |
+| `dgm` | [Darwin Gödel Machine](https://arxiv.org/abs/2505.22954), [jennyzzt/dgm](https://github.com/jennyzzt/dgm) | the genome is a coding agent, which rewrites itself; an open-ended archive | [docs](docs/recipes/dgm.md#how-it-differs-from-the-official-code) |
+| `hyperagents` | [Hyperagents](https://arxiv.org/abs/2603.19461), [facebookresearch/Hyperagents](https://github.com/facebookresearch/Hyperagents) | DGM, with the improvement procedure (a meta agent) inside the genome | [docs](docs/recipes/hyperagents.md#how-it-differs-from-the-official-code) |
+| `ga` | a textbook generational GA | tournament selection into a fixed-size population, no model needed | no original to compare with |
+| `evorlm` (experimental) | [shyamsn97/evorlm](https://github.com/shyamsn97/evorlm) | evolution run by one recursive language model, on rlmflow | [docs](evokit/recipes/experimental/evorlm.md#differences-from-the-original) |
+
+The "how it differs" sections compare each recipe with a specific commit of the original code
+(or with the paper, when there is no code). They are written by hand and can fall behind both
+sides; treat them as a starting point, not a guarantee. `evorlm` lives in
+`evokit.recipes.experimental.evorlm`, needs `rlmflow`, and is less tested than the others.
 
 ## From the shell
 
@@ -187,7 +214,7 @@ python run.py aircraft-landing --algorithm avo --agent claude --max-cost 5 --dir
 | `storages/` | `DirectoryStorage`, `MemoryStorage` |
 | `files/` | `Files` (a genome that is a set of files), `Project`, `ScriptEvaluator`, `with_lines` |
 | `agents/` | `Agent`, `Session` and their events (`ToolCall`, `Turn`), the harnesses (`ClaudeCode`, `CommandAgent`, `ReplAgent`), and the `evokit` command that carries tool calls |
-| `recipes/` | one function per published algorithm |
+| `recipes/` | one function per published algorithm; `recipes/experimental/` for ones with extra dependencies (`evorlm`) |
 | `interface/` | the commands over an experiment, the CLI (`evokit run`), the MCP server, and the skill |
 
 `import evokit as ek` gives the core and the implementation packages; `files`, `agents`,
@@ -197,10 +224,15 @@ python run.py aircraft-landing --algorithm avo --agent claude --max-cost 5 --dir
 
 | Doc | What it covers |
 | --- | --- |
-| [primitives.md](docs/primitives.md) | Types, components, storage and history (still describes `ask`/`tell`) |
-| [recipes.md](docs/recipes.md) | One loop per published algorithm: autoresearch, AVO, OpenEvolve, ShinkaEvolve, DGM, Hyperagents, a GA |
+| [primitives.md](docs/primitives.md) | `Task`, `Experiment`, archives, strategies, variation functions, agents, storage and the history |
+| [recipes.md](docs/recipes.md) | One loop per published algorithm, each with how it differs from the original |
 | [tasks.md](docs/tasks.md) | Task folders, `config.yaml`, the evaluator contract, the CLI |
 | [reading-runs.md](docs/reading-runs.md) | `log`, `show`, `diff`, `grep` over an experiment |
+
+`docs/research/` and `docs/design/` are working notes from earlier designs. They are kept for
+their reasoning, and most of their code no longer matches the library.
+
+The docs build with MkDocs (`pip install -r docs/requirements.txt && mkdocs serve`).
 
 ## TODO
 
@@ -220,12 +252,12 @@ Design work that is open, roughly in order:
 - [ ] **The agent's `evokit` command needs evokit installed.** A session puts a shim on the
   agent's `PATH` that imports `evokit`, which fails when the package is only on `sys.path` from
   the working directory.
-- [ ] **The rest of the docs** (`docs/primitives.md`, `docs/tasks.md`, `docs/recipes/`) still
-  describe the API before `Task` and `Experiment`.
+- [ ] **Re-check the recipes against their originals.** The "how it differs" sections were
+  written against one commit of each original; the originals keep moving.
 
 Docs and packaging:
 
-- [ ] `mkdocs.yml` still has template placeholders and no `nav`.
+- [ ] API reference pages generated from the docstrings.
 - [ ] `Makefile` is an unrendered cookiecutter template.
 
 ## Development

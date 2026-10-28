@@ -1,9 +1,13 @@
 # ShinkaEvolve
 
+!!! note "An implementation, not the official code"
+    This is EvoKit's version of ShinkaEvolve's loop, not a port of `SakanaAI/ShinkaEvolve`. See
+    [how it differs from the official code](#how-it-differs-from-the-official-code).
+
 [ShinkaEvolve](https://github.com/SakanaAI/ShinkaEvolve) (Sakana AI, 2025) adds four ideas to
 an AlphaEvolve-style loop:
 
-- islands, with migration every 10 admissions;
+- islands, with migration every 10 evaluations;
 - parents weighted by fitness and by how few children they have, plus inspirations;
 - an ensemble of LLMs chosen by a UCB1 bandit, and diff, full-rewrite or crossover edits;
 - novelty rejection before evaluation, and a meta-scratchpad of what has worked so far.
@@ -12,48 +16,51 @@ an AlphaEvolve-style loop:
 # evokit/recipes/shinka.py
 KINDS = {"diff": 0.6, "full": 0.3, "cross": 0.1}
 
-async def shinka(project, eval_fn, models, *, instructions, embed, judge, summarizer, storage,
-                 archive, workers=4, threshold=0.95, every=10, max_cost=10.0, max_evaluated=150,
-                 seed=0):
-    strategy = ShinkaParents(seed=seed)
-    bandit = ModelBandit(models).fit(storage)              # rewards from every child so far
-    notes = history.last_note(storage, "meta") or ""
+async def shinka(task, models, *, embed, judge, summarizer, dir=None, archive=None, workers=4,
+                 threshold=0.95, every=10, max_evaluations=150, max_cost=10.0, seed=None):
+    archive = archive or IslandArchive(islands=2, features=(), cell_size=50)
+    experiment = task.create_experiment(dir, archive=archive, max_evaluations=max_evaluations, max_cost=max_cost)
+    strategy, bandit = parents(objective=task.objective), ModelBandit(models, objective=task.objective)
 
     async def worker():
-        while under_budget():
+        while not experiment.limits.reached():
+            parent, *others = archive.sample(5, strategy) or [None]
+            if parent is None:
+                return
             kind = rng.choices(list(KINDS), list(KINDS.values()))[0]
-            name = rng.choices(*zip(*bandit.probabilities().items()))[0]
-            prompt = instructions + (f"\n\nWhat has worked so far:\n{notes}" if notes else "")
-            operator = make_operator(kind, models[name], project, prompt)   # diff, full rewrite, or crossover
-
-            asked = await evokit.ask(storage, archive, strategy, operator)
-            novel = [child for child in asked.individuals
-                     if await is_novel(child, archive, embed, judge, storage, threshold)]
-            evaluations = await asyncio.gather(*map(score, novel))
-            await evokit.tell(storage, archive, novel, evaluations)
-            for child in evaluated:
-                bandit.reward(child, history.individual(storage, child.parents[0]))
-            # migrate every `every` admissions; rewrite the meta notes every `every` evaluations
+            name = bandit.choose(experiment)                       # UCB1, from every child so far
+            notes = experiment.last_note("meta")
+            instructions = join_notes(task.instructions, notes and f"What has worked so far:\n{notes}")
+            if child := await experiment.create(vary(kind, models[name], parent, others, task, instructions)):
+                if await is_novel(child, archive, embed, judge, experiment, threshold):
+                    await experiment.submit(child.with_info(operator=f"{kind}/{name}"))
+                else:
+                    experiment.discard(child, "not novel")
+            if experiment.since_note("migrate") >= every:          # migrate every `every` evaluations
+                experiment.note("migrate")
+                archive.migrate(top=1)
+            if experiment.since_note("meta-started") >= every:     # and rewrite the scratchpad
+                experiment.note("meta-started")
+                reply = await summarizer.generate(META_PROMPT + describe(archive.top(20)))
+                experiment.note("meta", reply.text, reply.usage)
 
     await asyncio.gather(*(worker() for _ in range(workers)))
-    return archive.best()
+    return experiment.best()
 ```
 
-The caller passes `IslandArchive(islands=2, features=(), cell_size=50, storage=storage)`.
-Everything else a continued run needs is read from the storage: the bandit refits from past
-children, the migration schedule from `history.counts(storage)`, and the meta notes from the
-last `meta` note.
+Everything a continued run needs is read from the experiment: the bandit's pulls and rewards
+from the evaluated children, the migration and summary schedules from `migrate` and
+`meta-started` notes, and the scratchpad from the last `meta` note.
 
 The pieces that belong to this recipe live next to it:
 
-- **`ShinkaParents`** is a strategy. A parent's weight is sigmoid(normalized score) / (1 + children),
-  and the island's top members and some archive elites come back as `Selection.inspirations`.
+- **`parents`** is a strategy. A parent's weight is sigmoid(normalized score) / (1 + children);
+  the other picks, the inspirations, are the island's best members and then the best overall.
 - **`ModelBandit`** is UCB1 over models. Its reward is how much a child improved on its parent.
-  `fit(storage)` rewards it for every child already in the history.
-- **`is_novel(child, archive, embed, judge, storage, threshold)`** compares the child's embedding
-  with the archive. It asks the LLM judge when the closest member is within `threshold`, and notes
-  the cost of the check in the history. A child that fails is discarded with `history.discard`,
-  before evaluation.
+- **`is_novel(child, archive, embed, judge, experiment, threshold)`** compares the child's
+  embedding with the archive. It asks the LLM judge when the closest member is within
+  `threshold`, and notes the cost of the check in the experiment. A child that fails is
+  discarded with `experiment.discard`, before evaluation.
 
 ## How it differs from the official code
 
@@ -80,7 +87,7 @@ Compared with [SakanaAI/ShinkaEvolve](https://github.com/SakanaAI/ShinkaEvolve) 
 - **Migration is counted and moved differently.** ShinkaEvolve migrates every 10 generations.
   The library default rate is 0, so it is off; the circle-packing example uses 10%, moving
   (not copying) a random subset of correct programs while keeping each island's best. Here the
-  top member of each island is copied to the next island every 10 admissions.
+  top member of each island is copied to the next island every 10 evaluations.
 - **A simpler bandit.** ShinkaEvolve's UCB1 is asymmetric: rewards are shifted by the parent's
   and the initial program's scores and clipped at zero, incorrect children get the worst score,
   it explores with ε = 0.2, and the circle-packing example weighs cost in (coefficient 0.5). Here
@@ -106,8 +113,8 @@ Compared with [SakanaAI/ShinkaEvolve](https://github.com/SakanaAI/ShinkaEvolve) 
   settings.
 - **Different concurrency and stopping.** ShinkaEvolve runs separate pools of proposal and
   evaluation jobs (5 and 5 in the small example) and stops at 200 generations or $20 in that
-  example. Here 4 workers each run select, mutate, check, evaluate and tell, until 150 evaluations
-  or $10.
+  example. Here 4 workers each run select, mutate, check novelty and submit, until
+  150 evaluations or $10.
 - **Not here at all:** prompt evolution, spawning new islands on stagnation, multi-criteria and
   crowding archives, stored code diffs and their summaries, and ShinkaEvolve's web UI, W&B
   logging, Hydra and Slurm launchers.

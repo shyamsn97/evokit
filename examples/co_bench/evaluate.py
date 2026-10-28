@@ -116,7 +116,8 @@ def score(
         data.parent / ".evaluate.lock", "w"
     ) as lock:  # one evaluation at a time across all problems, as CO-Bench's FileLock
         fcntl.flock(lock, fcntl.LOCK_EX)
-        with concurrent.futures.ThreadPoolExecutor(workers or os.cpu_count()) as pool:
+        workers = workers or int(os.environ.get("CO_BENCH_WORKERS", 0)) or os.cpu_count()
+        with concurrent.futures.ThreadPoolExecutor(workers) as pool:
             futures = {
                 pool.submit(run_instance, source, data, instance, timeout): (case, i)
                 for case, i, instance in jobs

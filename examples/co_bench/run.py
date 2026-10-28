@@ -5,6 +5,7 @@
     python run.py bin-packing-one-dimensional --algorithm autoresearch --dir runs/bin-packing-autoresearch-0
     python run.py job-shop-scheduling --algorithm openevolve --model gpt-5-mini --dir runs/job-shop-openevolve-0
     python run.py aircraft-landing --algorithm avo --agent claude --max-cost 5 --dir runs/aircraft-avo-0
+    python run.py job-shop-scheduling --algorithm evorlm --dir runs/job-shop-evorlm-0     # needs rlmflow
 
 CO-Bench's protocol is 64 evaluations per problem with o3-mini (now retired by OpenAI), so 64 is the default
 (--max-evaluations 64). Agents: `claude` (Claude Code, $EVOKIT_AGENT_MODEL, default sonnet) or
@@ -18,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import evokit as ek
@@ -29,7 +31,7 @@ from evokit.operators import OpenAIModel
 from heldout import print_rows, test_run
 
 HERE = Path(__file__).resolve().parent
-ALGORITHMS = ("autoresearch", "avo", "openevolve")
+ALGORITHMS = ("autoresearch", "avo", "evorlm", "openevolve")
 PRICES = {
     "o3-mini": (1.1, 4.4),
     "o4-mini": (1.1, 4.4),
@@ -70,6 +72,7 @@ async def run(
     max_evaluations: int,
     max_cost: float,
     workers: int,
+    evaluate=None,
 ):
     folder = HERE / "tasks" / problem
     if not folder.is_dir():
@@ -78,8 +81,23 @@ async def run(
         )
     # heldout.py scores the best solve.py with the experiment's own copy of evaluate.py, in <dir>/env
     task = ek.Task.from_directory(folder, environment=Path(directory) / "env")
+    if evaluate is not None:
+        task = replace(task, evaluate=evaluate)
     limits = dict(max_evaluations=max_evaluations, max_cost=max_cost)
-    if algorithm == "autoresearch":
+    if algorithm == "evorlm":
+        from rlmflow import AgentConfig
+
+        from evokit.recipes.experimental.evorlm import evorlm
+
+        if agent_spec == "claude":
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            config = AgentConfig(harness="claude_code", model=os.environ.get("EVOKIT_AGENT_MODEL", "sonnet"), max_iters=18)
+        else:
+            config = AgentConfig(harness="repl", model=agent_spec.removeprefix("repl:"), max_iters=18)
+        # the root holds generations * max_ops * eval_budget evaluations; the seed is the 64th
+        await evorlm(task, config, dir=directory, generations=3, eval_budget=3,
+                     max_ops=max(1, (max_evaluations - 1) // 9), max_cost=max_cost, max_tokens=30_000_000)
+    elif algorithm == "autoresearch":
         archive = BestArchive()
         await recipes.autoresearch(task, agent(agent_spec, long=False), dir=directory, archive=archive, **limits)
     elif algorithm == "avo":
@@ -100,7 +118,7 @@ def main() -> None:
         "--dir", required=True, help="experiment directory (continues it if it exists)"
     )
     parser.add_argument(
-        "--agent", default="claude", help="claude or repl:MODEL (autoresearch, avo)"
+        "--agent", default="claude", help="claude or repl:MODEL (autoresearch, avo, evorlm)"
     )
     parser.add_argument(
         "--model", default="gpt-5-mini", help="OpenAI model (openevolve)"

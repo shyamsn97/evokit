@@ -3,9 +3,10 @@
 Every archive has members by id, metadata per member (any JSON: an island and a cell, a
 behaviour descriptor, a novelty score) and state of its own (any JSON: a threshold, a counter).
 A subclass writes `add`, its rule for who gets in, and changes the archive only through
-`insert`, `remove` and `set_state`. An experiment attaches its archive to its storage: from then
-on the base class appends each change to `<name>/changes.jsonl`, and an archive attached to an
-existing experiment replays that log, so it comes back exactly as it was.
+`insert`, `remove` and `set_state`. The base class appends each change to `<name>/changes.jsonl`
+in its storage: in memory until it is attached to an experiment's storage, which keeps its members
+from then on. An archive attached to an existing experiment replays that log, so it comes back
+exactly as it was.
 
 `sample(n, strategy)` picks members for a recipe (parents, inspirations): the archive offers its
 candidates and the strategy (see `evokit.strategies`) picks among them; `top(n)` gives the best.
@@ -20,6 +21,7 @@ from typing import Any
 
 from evokit.records import Individual
 from evokit.storage import Storage, append_json, decode, encode, read_json_lines
+from evokit.storages.memory import MemoryStorage
 from evokit.strategies import Strategy, uniform
 
 
@@ -51,7 +53,8 @@ class Archive(ABC):
 
     def __init__(self, name: str = "archive", seed: int | None = None):
         self.name = name
-        self.storage: Storage | None = None
+        self.storage: Storage = MemoryStorage()
+        self.attached = False
         self.log = f"{name}/changes.jsonl"
         self._members: dict[str, Individual] = {}
         self.metadata: dict[str, dict] = {}
@@ -61,14 +64,21 @@ class Archive(ABC):
     def attach(self, storage: Storage, objective: str = "score", minimize: bool = False) -> None:
         """Keep the archive in `storage` from now on, restoring what its log there holds. An
         archive that ranks gets the task's `objective` and `minimize` unless it was given its own."""
-        if self.storage is not None and self.storage is not storage:
+        if self.attached and self.storage is not storage:
             raise ValueError("this archive already belongs to another experiment")
-        self.storage = storage
+        self.storage, self.attached = storage, True
         if storage.exists(self.log):
             self._members, self.metadata, self.state = _replay(storage, self.log)
         else:
             for individual in list(self._members.values()):
                 self._append({"inserted": encode(individual, storage), "metadata": self.metadata[individual.id]})
+
+    def __getstate__(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if k not in ("storage", "attached")}
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self.storage, self.attached = MemoryStorage(), False
 
     @abstractmethod
     def add(self, individual: Individual) -> bool:
@@ -78,7 +88,7 @@ class Archive(ABC):
         """Make `individual` a member. Inserting a member again replaces its metadata."""
         self._members[individual.id] = individual
         self.metadata[individual.id] = metadata
-        self._append({"inserted": encode(individual, self.storage) if self.storage else None, "metadata": metadata})
+        self._append({"inserted": encode(individual, self.storage), "metadata": metadata})
 
     def remove(self, id: str) -> None:
         del self._members[id]
@@ -90,8 +100,7 @@ class Archive(ABC):
         self._append({"state": self.state})
 
     def _append(self, change: dict) -> None:
-        if self.storage is not None:
-            append_json(self.storage, self.log, {**change, "time": time.time()})
+        append_json(self.storage, self.log, {**change, "time": time.time()})
 
     def members(self) -> list[Individual]:
         return list(self._members.values())

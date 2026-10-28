@@ -1,12 +1,13 @@
 # Tasks
 
-A task is a folder that defines one problem. It is the only way to define a task: the CLI
-and Python both load the same folder into the same objects.
+A task folder defines one problem. The CLI and Python load the same folder into the same `Task`.
+(In Python, `ek.Task(seed, evaluate)` also works without a folder, for genomes that are not
+files.)
 
 ```text
 packing/
-  TASK.md        what the operator is told: the goal, the rules, what "better" means
-  config.yaml    which files evolve, how they are scored, which components a CLI run uses
+  TASK.md        what agents and models are told: the goal, the rules, what "better" means
+  config.yaml    which files evolve and how they are scored (task:), and optionally a recipe (recipe:)
   evaluate.py    the evaluator: part of the fixed environment, never evolved
   main.py        the seed: the genome files as they are now
 ```
@@ -17,105 +18,94 @@ with your problem.
 
 ## From the shell
 
-Every run command takes `--dir` (the run directory). The first command on a new directory also
-needs `--task`: it creates the run, evaluates the task's genome files as the seed, and adds the
-seed to the archive. Later commands continue the run. The run records its task folder in
-`run/task.json`, so `--task` is not needed again.
+Every command takes `--dir`, the experiment's directory (default `.evokit`, or `$EVOKIT_DIR`).
 
 ```bash
 evokit init packing
-evokit status --task packing --dir runs/0      # creates and seeds runs/0
-evokit select-individuals --dir runs/0
-evokit run --dir runs/0 --max-cost 5           # when config.yaml names an operator
+evokit run avo packing --dir experiments/0 --max-cost 5    # a recipe on the task
+evokit run packing --dir experiments/0                     # the recipe named in config.yaml
+evokit stats --dir experiments/0                           # evaluations, cost, the best
+evokit log --dir experiments/0                             # the lineage; also show, diff, grep, notes
 ```
 
-`evokit run` stops at whichever limit comes first: `--max-evaluations`, `--max-cost` (US dollars),
-or `--max-failures` (operator calls that failed in a row, default 10, so a broken agent or a bad
-API key stops the run instead of spinning). Before the first step it makes one small call to the
-operator's model or agent, so a setup error fails at once. One process drives a run at a time; a
-second `evokit run` on the same directory exits with `run_busy`.
+`evokit run RECIPE TASK_DIR` takes the recipe's own options, parsed from its signature
+(`--max-cost 5`, `--max-evaluations 50`, `--stall-after 5`). A recipe that takes an agent gets
+`--agent claude` (the default, Claude Code) or `--agent "COMMAND"` (any command, run in the
+agent's directory, with `{prompt}` in it replaced by the prompt, or the prompt on stdin). `RECIPE` can also be `FILE.py:NAME`, a recipe of
+your own. `evokit run` on an existing directory continues the experiment.
+
+When an outside coding agent is the operator, it drives the experiment one command at a time:
+
+```bash
+evokit status --task packing --dir experiments/0             # creates and seeds experiments/0
+evokit list-individuals --dir experiments/0
+evokit checkout-individual ID work/ --dir experiments/0
+# ... edit work/main.py ...
+evokit evaluate-directory work/ --parent ID --name "one line" --dir experiments/0
+```
+
+The first command on a new directory needs `--task`: it creates the experiment, evaluates the
+task's genome files as the seed, and adds the seed to a `BestArchive`. Later commands continue
+it; the experiment records its task folder in `task.json`, so `--task` is not needed again. An
+experiment belongs to one task: a different `--task` for an existing directory is an error.
+`evokit skill export claude` (or `cursor`, `codex`) installs instructions that teach an agent
+these commands.
 
 If the seed fails its evaluation, the command exits with a usage error that includes the
-evaluator's feedback, and nothing is recorded. Fix the files and run the command again. A run
-belongs to one task: passing a different `--task` for an existing run directory is an error.
+evaluator's feedback, and nothing is recorded. Fix the files and run the command again. One
+process drives an experiment at a time; a second one on the same directory exits with
+`run_busy`. Read commands (`stats`, `log`, `show`, `diff`, `grep`, `notes`) never take the lock.
 
 ## From Python
 
 ```python
 import evokit as ek
-from evokit.storages import DirectoryStorage
+from evokit import recipes
 
-task = ek.load_task("packing", environment="runs/0/env")
-task.project        # Project: the genome patterns from config.yaml; TASK.md, config.yaml and evaluate* protected
-task.eval_fn        # ScriptEvaluator(task.project, config.yaml's evaluate command and timeout)
-task.instructions   # the text of TASK.md
-task.seed()         # Individual.new(task.project.seed_genome(), info={"note": "seed"})
+task = ek.Task.from_directory("packing")
+task.seed            # Files: the genome files as they are now
+task.evaluate        # ScriptEvaluator: config.yaml's evaluate command and timeout
+task.instructions    # the text of TASK.md
+task.files           # Project: which files are genome, which are environment
 
-archive, strategy, operator = task.components(storage)   # what config.yaml's run section names
-run = task.open(DirectoryStorage("runs/0"))               # RunCommands: seeds a new storage, continues an old one
+best = await recipes.avo(task, ek.ClaudeCode(), dir="experiments/0", max_cost=5)
 ```
 
-`task.open(storage)` is what every CLI command does. The recipes skip the `run` section and take the parts
-they need, for example `recipes.avo(task.project, task.eval_fn, agent, instructions=task.instructions, ...)`.
-[`examples/circle_packing`](../examples/circle_packing) is a task folder, and its
-`algorithms/` scripts load it this way.
+[`examples/circle_packing`](https://github.com/shyamsn97/evokit/tree/main/examples/circle_packing)
+is a task folder, and its `algorithms/` scripts load it this way.
 
 ## Folder to objects
 
 | In the folder | Becomes |
 | --- | --- |
-| the folder, `task.genome`, `task.ignore` | `Project(folder, genome=..., protected=(evaluate*, eval/**, .git/**, config.yaml, TASK.md), ignore=...)` |
-| everything that is not genome | the environment: copied once into `<run>/env`, so later edits to the folder do not change a run |
-| `task.evaluate`, `task.timeout` | `ScriptEvaluator(project, evaluate, timeout)`, the eval function |
-| `task.objective`, `task.minimize` | the archive's `objective` and `minimize` |
-| `TASK.md` | `task.instructions`: the operator's instructions, and the task section of the exported skill |
-| the genome files as they are | the seed individual |
-| `run`: `archive`, `strategy`, `operator` | the components, by name; `*_options` mappings are keyword arguments |
-| `run.factory: evo:build` | `build(task, storage)` in `evo.py` returns the components instead |
+| `task.genome` | the genome patterns: the files that evolve, read as a `Files` value |
+| everything else | the environment, read-only: `evaluate*`, `eval/**`, `config.yaml` and `TASK.md` are protected, and an agent that edits them is rejected |
+| `task.evaluate`, `task.timeout` | `ScriptEvaluator(files, evaluate, timeout)`, the task's `evaluate` |
+| `task.objective`, `task.minimize` | what ranked archives rank by |
+| `TASK.md` | `task.instructions`, and the task section of an agent's system prompt |
+| the genome files as they are | `task.seed` |
+| `recipe:` | what `evokit run TASK_DIR` runs: `name`, and default options for it |
 
-`runs/**` and `.evokit/**` inside the folder are ignored, and so is a run directory placed
-anywhere inside it.
+`runs/**`, `experiments/**` and `.evokit/**` inside the folder are ignored, and so is an
+experiment directory placed anywhere inside it. From the CLI, the environment is snapshotted once
+into `<experiment>/env`, so later edits to the folder do not change a running experiment.
 
 ## config.yaml
 
 ```yaml
 task:
   genome: [main.py]             # glob patterns of the files that evolve
-  evaluate: python evaluate.py  # run in a copy of the folder
+  evaluate: python evaluate.py  # run in a fresh copy of the folder
   timeout: 2m
   objective: score
   minimize: false
   # ignore: [data/cache/**]     # neither genome nor environment
 
-run:                            # every key is optional
-  archive: best                 # best | simpler | population | islands | unbounded | latest
-  strategy: greedy              # greedy | tournament | proportional | islands
-  operator: none                # none | diff | rewrite | coding-agent
-  # model: claude-sonnet-4-5    # diff and rewrite: AnthropicModel(model, price=price)
-  # price: [3.0, 15.0]          # USD per million input and output tokens
-  # agent: claude               # coding-agent: ClaudeCode(), or a command for CommandAgent
-  # archive_options: {size: 20}
-  # strategy_options: {size: 3}
-  # operator_options: {max_draft_evals: 5}   # coding-agent: drafts scored by task.evaluate
-  # factory: evo:build
+recipe:                         # optional: what `evokit run THIS_FOLDER` runs
+  name: avo                     # avo | autoresearch | dgm | ... | FILE.py:NAME
+  agent: claude                 # claude (Claude Code), or a command run in the agent's folder
+  max_cost: 5                   # any other option of the recipe
 ```
-
-With `operator: none`, whoever drives the CLI is the operator: the coding agent you are
-talking to (see `evokit skill export`), or a script. With an operator, `evokit run` runs ask,
-evaluate and tell until a limit is reached.
-
-The factory is the escape hatch for anything the names cannot express. It replaces the
-`archive`, `strategy` and `operator` keys:
-
-```python
-# evo.py, next to config.yaml
-def build(task, storage):
-    archive = SimplerBestArchive("score", size="lines", storage=storage)   # storage=storage: it restores itself
-    return archive, Greedy(), with_lines(task.eval_fn)
-```
-
-It returns one archive, one strategy, at most one operator, at most one eval function (the
-default is `task.eval_fn`), and any other objects whose `@command` methods become commands.
 
 ## The evaluator contract
 
@@ -123,19 +113,17 @@ default is `task.eval_fn`), and any other objects whose `@command` methods becom
 
 - **Metrics.** The last stdout line that is a JSON object is the result. Its numbers become
   objectives, `"feedback"` is text the operator reads next time, and `"usage"` (for example
-  `{"cost_usd": 0.02}`) is added to the run's spending. Without a JSON line, `name: number` lines
-  are read instead.
+  `{"cost_usd": 0.02}`) is added to the experiment's spending. Without a JSON line,
+  `name: number` lines are read instead.
 - **Rejection.** A non-zero exit is a failed evaluation, with no objectives. stderr (or stdout) is
   the feedback. A failed individual is recorded but never admitted.
 - **Artifacts.** `$EVOKIT_WORKDIR` is the individual's artifact folder; files written there are
-  kept at `artifacts/<id>/` in the run. A coding agent's session is kept there too, as
-  `agent.jsonl`.
+  kept at `artifacts/<id>/` in the experiment.
 - **Time.** `task.timeout` bounds it. A timeout is a failed evaluation.
 
 ## An individual
 
-Every command that returns individuals (`list-individuals`,
-`evaluate-directory`) prints:
+Commands that return individuals (`list-individuals`, `evaluate-directory`) print:
 
 ```json
 {
@@ -149,9 +137,9 @@ Every command that returns individuals (`list-individuals`,
 }
 ```
 
-`genome` lists the files, not their contents. Read a run like a git repository (see
-[reading-runs.md](reading-runs.md)): `evokit log [ID] [--all]` for the lineage, `evokit show ID
-[PATH]` for one individual or one of its files, `evokit diff A [B]` for what changed, and `evokit
-grep PATTERN` to find what was tried. `evokit checkout-individual ID DIR` writes one out.
+`genome` lists the files, not their contents. Read an experiment like a git repository (see
+[reading runs](reading-runs.md)): `evokit log [ID] [--all]` for the lineage, `evokit show ID
+[PATH]` for one individual or one of its files, `evokit diff A [B]` for what changed, and
+`evokit grep PATTERN` to find what was tried. `evokit checkout-individual ID DIR` writes one out.
 `evaluation` is `null` until the individual is evaluated, and has no objectives if it failed.
 `info.admitted` says whether the archive kept it.

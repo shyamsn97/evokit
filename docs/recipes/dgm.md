@@ -1,61 +1,70 @@
 # Darwin Gödel Machine
 
+!!! note "An implementation, not the official code"
+    This is EvoKit's version of the DGM loop, not a port of `jennyzzt/dgm`, and it does not
+    reproduce the paper's SWE-bench setup. See
+    [how it differs from the official code](#how-it-differs-from-the-official-code).
+
 In the [Darwin Gödel Machine](https://arxiv.org/abs/2505.22954), the genome is a coding
 agent's repository:
 
 - Every agent that still works is kept, so the archive is open-ended.
 - Parents are sampled by score, discounted by how many children they already have.
 - The parent agent reads the logs of its own evaluation, proposes one improvement to itself,
-  and implements it on a copy of its code. That is `SelfModify`.
+  and implements it on a copy of its code. That is `self_modify`.
 - Evaluation is staged: a few tasks first, and the full benchmark only for agents that do well
   on those.
 
 ```python
 # evokit/recipes/dgm.py
-async def dgm(eval_fn, *, storage, archive, operator=None, fixed_agent=None, instructions=None,
-              workers=4, max_children=80, sharpness=10.0, midpoint=0.5, open_ended=True):
-    strategy = ProportionalSelection(sharpness, midpoint) if open_ended else Greedy()
-    operator = operator or SelfModify(storage, fixed_agent=fixed_agent, instructions=instructions)
+async def dgm(task, *, dir=None, archive=None, modify=None, fixed_agent=None, workers=4,
+              max_children=80, max_cost=None, max_evaluations=None, sharpness=10.0, midpoint=0.5,
+              open_ended=True):
+    archive = archive or (UnboundedArchive() if open_ended else LatestArchive())
+    experiment = task.create_experiment(dir, archive=archive, max_cost=max_cost,
+                                        max_evaluations=max_evaluations, stop=(children,))  # max_children
+    strategy = proportional(sharpness, midpoint, objective=task.objective) if open_ended else None
+    modify = modify or partial(self_modify, fixed_agent=fixed_agent, objective=task.objective)
 
     async def worker():
-        while history.counts(storage)["created"] <= max_children:
-            asked = await evokit.ask(storage, archive, strategy, operator)
-            if asked.exhausted:
+        while not experiment.limits.reached():
+            parents = archive.sample(1, strategy)
+            if not parents:
                 return
-            evaluations = await asyncio.gather(*map(score, asked.individuals))
-            await evokit.tell(storage, archive, asked.individuals, evaluations)
+            if child := await experiment.create(modify(parents[0], experiment)):
+                await experiment.submit(child)
 
     await asyncio.gather(*(worker() for _ in range(workers)))
-    return archive.best()
+    return experiment.best()
 
 
 def staged_eval(quick, full, promote):
     """Run `quick`; only if promote(its evaluation), run `full` and return that."""
-    quick, full = as_eval_fn(quick), as_eval_fn(full)
+    quick, full = as_evaluate(quick), as_evaluate(full)
     async def staged(individual):
         evaluation = await quick(individual)
         return await full(individual) if promote(evaluation) else evaluation
     return staged
 ```
 
-The caller brings the seed agent and the evaluation:
+The caller brings the seed agent and the evaluation, as a task:
 
 ```python
-storage = DirectoryStorage("runs/dgm")
-eval_fn = staged_eval(run_10_tasks, run_50_tasks, promote=lambda e: e.objectives.get("score", 0) >= 0.4)
-archive = UnboundedArchive("score", storage=storage)
-if not archive.members():
-    seed = Individual.new(Files.from_directory("seed_agent"))
-    await evokit.tell(storage, archive, [seed], [await evokit.as_eval_fn(eval_fn)(seed)])
-await recipes.dgm(eval_fn, storage=storage, archive=archive)
+evaluate = staged_eval(run_10_tasks, run_50_tasks, promote=lambda e: e.objectives.get("score", 0) >= 0.4)
+task = ek.Task(seed=Files.from_directory("seed_agent"), evaluate=evaluate,
+               instructions="The agent is scored on ...")      # told to the diagnosing agent
+best = await recipes.dgm(task, dir="experiments/dgm-0")
 ```
+
+The evaluation runs the agent (`operators.script_agent`) on the benchmark, fails agents that can
+no longer do the task, and returns logs under `logs/` (`Evaluation.logs`) for the next diagnosis.
 
 The paper's ablations:
 
 - **No self-improvement:** pass `fixed_agent=seed_agent`, so the seed agent makes every
   modification.
-- **Not open-ended:** pass `open_ended=False` and a `LatestArchive("score", storage=storage)`,
-  so the loop builds greedily on the newest working agent.
+- **Not open-ended:** pass `open_ended=False`, so the archive is a `LatestArchive` and the loop
+  builds greedily on the newest working agent.
 
 ## How it differs from the official code
 
@@ -63,7 +72,7 @@ Compared with [jennyzzt/dgm](https://github.com/jennyzzt/dgm) at commit `a565fd2
 
 - **A general loop, not a SWE-bench pipeline.** The official code evolves a coding agent on
   SWE-bench Verified (or Polyglot) through Docker harnesses. This recipe is benchmark-agnostic: the
-  caller's `eval_fn` scores the agent. The bundled example scores agents on circle packing.
+  task's `evaluate` scores the agent. The bundled example scores agents on circle packing.
 - **Diagnosis is a separate model there, the parent agent here.** The official loop first picks
   one task for the parent to improve on. It is a random unresolved SWE-bench instance, or, with set
   probabilities, a special entry about empty patches, stochastic results, or context length. Then
@@ -77,13 +86,13 @@ Compared with [jennyzzt/dgm](https://github.com/jennyzzt/dgm) at commit `a565fd2
   `coding_agent.py --self_improve` with a 30-minute timeout. Here the parent's files are copied to a
   temporary directory on the host, and the edited directory is the child.
 - **Generations versus continuous workers.** The official loop runs 80 generations; each picks 2
-  parents, improves them with 2 threads, then updates the archive. Here 4 workers run
-  select, improve, evaluate and tell continuously, until 80 children have been created.
+  parents, improves them with 2 threads, then updates the archive. Here 4 workers select,
+  improve and submit continuously, until 80 children have been created.
 - **Fewer parent rules.** Both default to sigmoid(10 × (score − 0.5)) × 1 / (1 + children). The
   official code also has `score_prop` (no child discount), `best`, `random`, and the `no_darwin`
-  baseline (always the latest). Here there are `ProportionalSelection` and `Greedy`, and
-  `ProportionalSelection` also skips parents that already score 1.0, which the official code does
-  not do.
+  baseline (always the latest). Here there are `proportional` and, with `open_ended=False`, the
+  newest agent. `proportional` also skips parents that already score 1.0, which the official code
+  does not do.
 - **Archive admission.** Officially, every child that "compiles" is kept (`keep_all`): it has
   harness results, at least one non-empty patch, and enough submitted instances. The option
   `keep_better` keeps only children within 0.1 of the initial agent's score. Here every child with

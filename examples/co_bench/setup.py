@@ -9,6 +9,7 @@ part of evokit: this script fetches it from Hugging Face at a pinned revision.
     python setup.py                          # the five default problems
     python setup.py "Job shop scheduling"    # any of the 36, by name
     python setup.py --list
+    python setup.py --all
 
 Each problem becomes tasks/<slug>/ (solve.py, TASK.md, config.yaml, evaluate.py, problem.json),
 with its data in data/<problem>/. Both are generated, so they are not committed.
@@ -154,12 +155,13 @@ def main() -> None:
         "problems", nargs="*", help=f"problem names (default: {', '.join(DEFAULT)})"
     )
     parser.add_argument("--list", action="store_true", help="list the 36 problems")
+    parser.add_argument("--all", action="store_true", help="set up all 36 problems")
     args = parser.parse_args()
     if args.list:
         print("\n".join(problems()))
         return
     known = problems()
-    for problem in args.problems or DEFAULT:
+    for problem in known if args.all else args.problems or DEFAULT:
         if problem not in known:
             sys.exit(f"unknown problem {problem!r}; see --list")
         print(f"{problem}:")

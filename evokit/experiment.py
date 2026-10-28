@@ -647,9 +647,9 @@ class Experiment:
 
 
 def _template(archive: Archive) -> Archive:
-    """`archive` with no members and no storage: what `open_experiment` attaches again."""
+    """`archive` with no members, in memory: what `open_experiment` attaches again."""
     template = copy.copy(archive)
-    template.storage, template._members, template.metadata, template.state = None, {}, {}, {}
+    template._members, template.metadata, template.state = {}, {}, {}
     return template
 
 

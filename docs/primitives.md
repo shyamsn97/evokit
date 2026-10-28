@@ -1,400 +1,310 @@
 # Primitives
 
-EvoKit provides the pieces of an evolutionary algorithm, as functions and components. A
-recipe is a plain loop that stitches them together ([recipes](recipes.md)). There is no
-`Experiment` class, no base class to inherit from, no event bus, and no hooks. To change what
-a recipe does, you edit its loop or copy it. The code below is condensed from the
-implementation; the files it names are the full versions.
+EvoKit gives the pieces of an evolutionary algorithm as plain objects and functions. A recipe is
+a loop that stitches them together ([recipes](recipes.md)). There is no base class to inherit
+from, no event bus and no hooks: to change what a recipe does, edit its loop or copy it.
+
+The code below is condensed from the implementation; the files it names are the full versions.
+
+!!! warning "Work in progress"
+    These interfaces are still changing. Names and signatures here match the code at the time
+    of writing; the docstrings in `evokit/` are the source of truth.
 
 Every recipe has the same core:
 
 ```python
-import evokit
+import evokit as ek
 
-@evokit.eval_fn(timeout="10m")
-def score(individual) -> evokit.Evaluation: ...
-
-asked = await evokit.ask(storage, archive, strategy, operator)
-evaluations = await asyncio.gather(*map(score, asked.individuals))
-admitted = await evokit.tell(storage, archive, asked.individuals, evaluations)
+task = ek.Task(seed=genome, evaluate=score)                        # what evolves, how it is scored
+experiment = task.create_experiment("experiments/0", max_cost=5)   # one search; seeded or continued
+while not experiment.limits.reached():
+    parent, *others = experiment.archive.sample(3)                 # selection
+    if child := await experiment.create(vary(parent, others)):     # variation, recorded with its cost
+        await experiment.submit(child)                             # evaluation and survival, recorded
 ```
 
-`ask` and `tell` take the storage first and are plural. Evaluating needs no storage: the eval
-function scores one individual and returns its files as `Evaluation.logs`, which `tell` stores.
-What goes into the archive first is the caller's input.
+`create` and `submit` are the only two ways in. Everything they do is written to the
+experiment's history, so a recipe never records anything by hand.
 
 ## Types
+
+`evokit/records.py` holds plain data, with no behaviour:
 
 ```python
 @dataclass(frozen=True)
 class Individual:
     id: str
-    genome: Genome
-    parents: tuple[str, ...]
-    info: dict
-    evaluation: Evaluation | None      # set with individual.with_evaluation(...), which returns a copy
-    name: str                          # one line saying what this version is, set by its operator
-    description: str                   # what changed and why
+    genome: Any                        # any JSON value, or a type with to_json/from_json (e.g. Files)
+    parents: tuple[str, ...] = ()
+    info: Mapping[str, Any] = {}       # e.g. {"operator": "diff", "admitted": True}
+    evaluation: Evaluation | None = None
+    name: str = ""                     # one line saying what this version is, like a commit subject
+    description: str = ""              # what changed and why, like a commit body
+
+    @classmethod
+    def new(cls, genome, parents=(), info=None, *, name="", description="") -> Individual: ...
+    def with_evaluation(self, evaluation) -> Individual: ...   # copies; records are frozen
+    def with_info(self, **info) -> Individual: ...
+    def objective(self, name) -> float | None: ...
 
 
 @dataclass(frozen=True)
 class Evaluation:
-    objectives: dict[str, float]       # empty if the program crashed, timed out or was invalid
-    feedback: str = ""                 # what the next attempt should know, e.g. a traceback or failing tests
-    usage: dict[str, float] = field(default_factory=dict)    # what evaluating cost
-
-
-@dataclass(frozen=True)
-class Selection:                       # what a strategy picks for one child-to-be
-    parents: tuple[Individual, ...]
-    inspirations: tuple[Individual, ...] = ()
-
-
-@dataclass(frozen=True)
-class Offspring:                       # what an operator returns
-    children: tuple[Individual, ...]
-    usage: dict[str, float]            # what creating them cost
-    logs: Mapping[str, bytes]          # e.g. an agent's transcript; ask stores them in each child's artifacts
-
-
-@dataclass(frozen=True)
-class Failure:                         # an operator call that produced nothing
-    selection: Selection
-    reason: str
-    usage: dict[str, float]
-
-
-@dataclass(frozen=True)
-class Asked:
-    individuals: tuple[Individual, ...]
-    failures: tuple[Failure, ...] = ()
-    exhausted: bool = False            # nothing to select right now
+    objectives: dict[str, float] = {}  # empty if the program crashed, timed out or was invalid
+    feedback: str = ""                 # what the next attempt should know: a traceback, failing tests
+    usage: dict[str, float] = {}       # what evaluating cost: cost_usd, tokens, seconds, ...
+    logs: Mapping[str, bytes] = {}     # files kept under artifacts/<id>/, not in the history
 ```
 
-## Components
+An evaluation with no objectives is a failure. There is no separate status field.
 
-The components are the actual algorithms:
+## Task
 
-| Interface | Implementations |
-| --- | --- |
-| `Archive(storage=None)`, `add(individual) -> bool`, `members()`, `metadata`, `state`, `best()`, `get(id)` | `BestArchive`, `SimplerBestArchive`, `PopulationArchive`, `RankedArchive`, `UnboundedArchive`, `LatestArchive`, `NoveltyArchive`, `IslandArchive` (with `niches()` and `migrate(top)`) |
-| `Strategy.select(archive, n) -> list[Selection]` | `Greedy`, `Tournament`, `ProportionalSelection`, `IslandSampler` |
-| `Operator.create(selection, archive) -> Offspring`; raises `OperatorError(reason, usage)` | `DiffOperator`, `FileRewriteOperator`, `CodingAgentOperator`, `SelfModify`, `MetaAgentModify`, `Choice` |
-| `eval_fn(individual) -> Evaluation`, sync or async; `@ek.eval_fn(timeout=, executor=)` makes it async and turns crashes and timeouts into failed evaluations | `ScriptEvaluator`, `with_lines`, your function |
+`evokit/task.py`. A task is what evolves and how it is scored:
 
-Strategies read everything they need from the archive. For example, `ProportionalSelection`
-counts a member's children from the parents of the other members. So strategies keep no
-state that has to be saved.
+```python
+task = ek.Task(
+    seed=1.0,                          # the first genome
+    evaluate=score,                    # score(individual) -> Evaluation, sync or async
+    instructions="Make it close to 3", # what agents and models are told
+    objective="score",                 # what ranked archives rank by
+    minimize=False,
+)
+task = ek.Task.from_directory("examples/circle_packing")   # a task folder: see tasks.md
+```
+
+`evaluate` is the one place scores come from. `@ek.evaluator(timeout="10m")` makes a function
+async and never raising: a crash, a timeout or a wrong return type becomes an evaluation with no
+objectives. The experiment wraps `evaluate` this way if you did not.
+
+A task folder's genome is a `Files` value (a set of files), and the rest of the folder is a
+read-only environment: `task.checkout(genome, dir)` writes both into a directory, and
+`task.read(dir)` reads the genome back, raising `EnvironmentModified` if the fixed files were
+edited. Agents work in such a checkout. A non-file genome is checked out as `genome.json`.
+
+## Experiment
+
+`evokit/experiment.py`. One search on a task: its history, its archive and its limits.
+
+```python
+experiment = task.create_experiment(
+    "experiments/0",                   # a directory (DirectoryStorage); None keeps it in memory
+    archive=ek.BestArchive(),          # the default
+    max_cost=5.0,                      # US dollars, everything included
+    max_evaluations=None,
+    max_failures=10,                   # failed variations in a row
+    stop=[lambda e: "plateau" if e.since_improvement() >= 30 else None],
+)
+experiment = ek.open_experiment("experiments/0")   # read one back (and continue it, given its task)
+```
+
+A new experiment scores the seed into the archive. If the seed fails its evaluation, it raises
+`UsageError` and records nothing. On an existing directory, `create_experiment` continues: the
+archive replays its own log, and children that a crash left unevaluated are submitted again. A
+recipe never knows whether it is continuing.
+
+### What goes in
+
+```python
+child = await experiment.create(make)        # make: an awaitable of (child, usage)
+child = await experiment.submit(individual)  # scored by task.evaluate, offered to the archive
+experiment.note("review", text, usage)       # anything else worth keeping
+experiment.discard(individual, "not novel")  # created, but will not be evaluated
+```
+
+- `create` awaits a variation function and records the child as created, with its cost. If the
+  variation raises `OperatorError(reason, usage, logs)`, it records a `failed` note with the cost
+  (its logs go under `failed/<id>/`) and returns `None`.
+- `submit` scores the individual with the task's `evaluate`, never with a score the caller
+  passes, offers it to the archive, and records both. It records the individual as created first
+  if `create` did not. It returns the individual with its evaluation and `info["admitted"]`.
+
+**Every cost is in the experiment.** Creating, evaluating, failed variations, agent turns and
+notes each record their own `usage`, so `experiment.cost()` is the cost of the whole search and
+the limits hold across restarts.
+
+### Limits
+
+`experiment.limits.reached()` returns why the experiment should stop, or `None`. It checks
+`max_evaluations` (seeds included), `max_cost`, `max_failures` and every `stop` rule. A stop
+rule is `rule(experiment) -> str | None`. `limits.remaining_cost()` is what is left of
+`max_cost`, which agents get as their per-turn budget.
+
+### What can be read
+
+```python
+experiment.best()                    # the archive's best
+experiment.cost(), experiment.usage()
+experiment.counts()                  # "created", "evaluated", "added", "discarded", each note kind
+experiment.evaluated()               # everything evaluated, in order
+experiment.admitted()                # what the archive admitted at the time
+experiment.pending()                 # created, not yet evaluated or discarded
+experiment.individual(id)
+experiment.notes("insight")          # newest first; also last_note(kind)
+experiment.since_improvement()       # attempts (evaluations and drafts) since the best improved
+experiment.since_note("migrate")     # attempts since the last note of a kind: for schedules
+experiment.best_over_time()          # the progress curve
+experiment.log(), .show(i), .diff(a, b), .grep(pattern)   # git-style reading, see reading-runs.md
+```
+
+Totals are kept in memory and brought up to date with what other processes appended before
+every read, so checking a budget every iteration reads only the new lines.
+
+Only one process drives an experiment at a time: the first write takes a driver lock, kept until
+the process exits or calls `experiment.close()`. Reading never takes it.
+
+## Archives
+
+`evokit/archive.py` and `evokit/archives/`. The archive is the population: it decides who
+survives (`add`), and offers its members for selection (`sample`, `top`).
+
+| Archive | Keeps | Default `sample` |
+| --- | --- | --- |
+| `BestArchive(ties="reject")` | the single best; `ties="accept"` lets equal scores replace it | `best` |
+| `SimplerBestArchive(size="lines")` | the single best; a tie wins only if it is smaller by `size` | `best` |
+| `PopulationArchive(size)` | the top `size` (truncation) | `uniform` |
+| `UnboundedArchive()` | everyone with a score (DGM's open-ended archive) | `uniform` |
+| `LatestArchive()` | only the newest with a score | `best` |
+| `NoveltyArchive(behaviour, k=15)` | individuals far from their `k` nearest members, with an adaptive threshold | `uniform` |
+| `IslandArchive(islands=4, features=("lines", "diversity"))` | islands of MAP-Elites grids; `migrate(top)` copies each island's best to the next | `uniform`, one island per call |
+
+Ranked archives take `objective=` and `minimize=`; without them they use the task's.
+
+```python
+parent, *others = archive.sample(3)                         # the archive's own strategy
+parents = archive.sample(10, strategy=tournament(3))        # or any other
+(best,) = archive.top(1)
+```
 
 ### Archives save themselves
 
-Every archive has three things, and nothing else is assumed:
-
-- **members**, by id;
-- **metadata** per member: any JSON the archive wants to keep about it, such as an island and a
-  cell, a behaviour descriptor, a novelty score, or a crowding distance;
-- **state** of its own: any JSON, such as a novelty threshold or a counter.
-
-A subclass writes `add`, its rule for who gets in. It changes the archive only through
-`insert`, `remove` and `set_state`. The base class appends each call to its own log in the
-storage, `archive/changes`, and when an archive is built on an existing run, it replays that
-log. Nobody writing an archive or a recipe handles saving.
+Every archive has **members** by id, **metadata** per member (any JSON: an island and a cell, a
+behaviour descriptor, a novelty score), and **state** of its own (any JSON: a threshold, a
+counter). A subclass writes `add`, its rule for who gets in, and changes the archive only
+through `insert`, `remove` and `set_state`:
 
 ```python
-class Archive:
-    def __init__(self, storage=None, name="archive"):
-        self.storage, self.log = storage, f"{name}/changes.jsonl"
-        self._members: dict[str, Individual] = {}
-        self.metadata: dict[str, dict] = {}
-        self.state: dict = {}
-        if storage is not None and storage.exists(self.log):    # an existing run: replay the log, in order
-            for line in storage.read(self.log).splitlines():
-                change = json.loads(line)
-                if "state" in change:
-                    self.state = change["state"]
-                elif "removed" in change:
-                    self._members.pop(change["removed"], None)
-                    self.metadata.pop(change["removed"], None)
-                else:
-                    individual = decode(change["inserted"], storage)
-                    self._members[individual.id], self.metadata[individual.id] = individual, change["metadata"]
-
-    def insert(self, individual, **metadata):               # inserting a member again replaces its metadata
-        self._members[individual.id], self.metadata[individual.id] = individual, metadata
-        self._append({"inserted": encode(individual, self.storage), "metadata": metadata})
-
-    def remove(self, id):
-        del self._members[id], self.metadata[id]
-        self._append({"removed": id})
-
-    def set_state(self, **state):
-        self.state = {**self.state, **state}
-        self._append({"state": self.state})
-
-    def _append(self, change):
-        if self.storage is not None:
-            self.storage.append(self.log, (json.dumps({**change, "time": time.time()}) + "\n").encode())
-
-    def members(self) -> list[Individual]:
-        return list(self._members.values())
-
-    def add(self, individual) -> bool:                      # the archive's rule: the one method a subclass writes
-        raise NotImplementedError
-```
-
-Three archives with nothing in common, written the same way:
-
-```python
-class BestArchive(Archive):                                 # one member, no metadata
+class BestArchive(RankedArchive):
     def add(self, individual):
-        best = self.best()
-        new = score(individual)                             # None if it has no score, e.g. it crashed
-        if new is None or (best and score(best) >= new):
+        if self.score(individual) is None:          # failed, or no such objective
             return False
-        if best:
+        best = self.best()
+        if best is not None and not self.admits(individual, best):
+            return False
+        if best is not None:
             self.remove(best.id)
         self.insert(individual)
         return True
-
-
-class NoveltyArchive(Archive):                              # k-nearest neighbours, no structure, an adaptive threshold
-    def add(self, individual):
-        behaviour = individual.evaluation.objectives["behaviour"]
-        others = [m["behaviour"] for m in self.metadata.values()]
-        novelty = mean(sorted(distance(behaviour, o) for o in others)[: self.k]) if others else math.inf
-        threshold = self.state.get("threshold", self.initial_threshold)
-        if novelty < threshold:
-            self.set_state(threshold=threshold * 0.95)
-            return False
-        self.insert(individual, behaviour=behaviour, novelty=novelty)
-        self.set_state(threshold=threshold * 1.05)
-        return True
-
-
-class IslandArchive(Archive):                               # islands of MAP-Elites grids
-    def add(self, individual):
-        island = self.metadata[individual.parents[0]]["island"] if individual.parents else 0
-        cell = self.cell(individual, island)
-        ...                                                 # keep the cell's best cell_size members
-        self.insert(individual, island=island, cell=cell)
-        return True
-
-    def niches(self):                                       # only archives with niches have niches()
-        grouped = defaultdict(list)
-        for id, m in self.metadata.items():
-            grouped[(m["island"], tuple(m["cell"]))].append(self._members[id])
-        return dict(grouped)
 ```
 
-A reloaded archive is the exact archive from before, including the copies
-`IslandArchive.migrate` makes. The log doesn't depend on the run's history: each insert carries
-the encoded individual, and genome contents go to the shared blobs, so no genome is stored
-twice. The log is also the history of the archive, so `compare.py` can show what the archive
-held at any point in the run. A run with two archives gives each a `name=`, and each gets its
-own folder.
+The base class appends each change to `<name>/changes.jsonl` in the experiment's storage. An
+archive attached to an existing experiment replays that log, so it comes back exactly as it was,
+including what `IslandArchive.migrate` copied. Nobody writing an archive or a recipe handles
+saving. The log is also the archive's history, so a tool can show what it held at any point.
+
+## Strategies
+
+`evokit/strategies.py`. A strategy is a plain function:
+
+```python
+def strategy(candidates: Sequence[Individual], n: int, archive: Archive) -> list[Individual]: ...
+```
+
+The archive offers its candidates, best first if it ranks (an `IslandArchive` one island at a
+time), and the strategy draws from `archive.rng`. EvoKit ships `best`, `uniform` and
+`tournament(size)`. Algorithm-specific strategies live in their recipes: DGM's `proportional`,
+OpenEvolve's `islands`, Shinka's `parents`. A strategy keeps no state; it reads what it needs
+from the archive (for example, child counts from the members' parents).
+
+## Variation functions
+
+`evokit/operators/`. A variation function makes one child and returns `(child, usage)`, or
+raises `OperatorError(reason, usage)`. It is what `experiment.create` awaits:
+
+| Function | For |
+| --- | --- |
+| `rewrite_text(model, parent, others, instructions=)` | `str` genomes: a full rewrite in a fenced block |
+| `diff(model, parent, others, task=)` | `Files` genomes: SEARCH/REPLACE diffs, respecting EVOLVE-BLOCK markers and the editable files |
+| `rewrite_files(model, parent, others, task=)` | `Files` genomes: complete new contents of the changed files |
+| `self_modify(parent, experiment)` | DGM: the parent agent diagnoses its own logs, then rewrites itself |
+| `meta_agent_modify(parent, experiment)` | Hyperagents: the parent's meta agent edits the whole repository |
+| `generate(model, prompt, parents, parse, operator)` | the building block for your own |
+
+Any async function returning `(child, usage)` works, including a plain mutation with no model
+(see `recipes.ga`).
+
+The models are `AnthropicModel(model, price=)`, `OpenAIModel(model, base_url=, price=)` (any
+OpenAI-compatible endpoint) and `FunctionModel(fn)` (for tests and custom clients). `price` is
+US dollars per million input and output tokens, so their usage carries `cost_usd`.
+
+## Agents
+
+`evokit/agents/`. An `Agent` is a coding harness EvoKit can drive: `ClaudeCode`, `CommandAgent`
+(any command run in the agent's directory), `ReplAgent` (Python functions in a REPL), or your
+own. The agent layer knows nothing about evolution: it opens sessions in a directory with tools
+and a system prompt, and `session.prompt(text, output=Dataclass)` streams `ToolCall` events and
+ends with a `Turn`, whose `output` is what the agent passed to its `finish` tool.
+
+`experiment.start(agent)` puts an agent to work on an experiment:
+
+```python
+async with experiment.start(agent, start=parent, submit=True) as directory:
+    async for event in agent.prompt("Improve it; submit what is better."):
+        if experiment.since_improvement() > 5:
+            agent.send("Try a different data structure.")   # reaches it at its next step
+```
+
+Inside the block:
+
+- `directory` is a checkout of `start` (default: the best), deleted when the block ends.
+- The agent's tools are `stats`, `log`, `show`, `diff`, `grep`, `notes` and `remember` over the
+  experiment, `score` (scores its files as they are and records a `draft` note, keeping
+  nothing), and, with `submit=True`, `submit` (scores them and offers them to the archive).
+  `tools=` adds your own. Shell agents reach them as an `evokit` command on their `PATH`.
+- `agent.prompt` and `agent.send` talk to one conversation. Each prompt may spend what the
+  limits leave, the agent is stopped once a limit is reached, and every turn is recorded as a
+  `turn` note with its transcript under `sessions/`.
+- `agent.fresh()` is the same agent in a conversation of its own that can only read the
+  experiment, for example a reviewer.
 
 ## Storage
 
-Storage reads and writes bytes at paths. It knows nothing about individuals, archives, logs or
-costs, so a backend only implements these methods:
+`evokit/storage.py` and `evokit/storages/`. Storage is bytes at paths. It knows nothing about
+individuals, archives or costs, so a backend implements only these:
 
 ```python
 class Storage:
-    def write(self, path: str, data: bytes) -> None: ...
-    def read(self, path: str) -> bytes: ...
-    def exists(self, path: str) -> bool: ...
-    def list(self, prefix: str) -> list[str]: ...                  # paths under prefix, sorted
-    def append(self, path: str, data: bytes) -> None: ...         # add to the end of the file at path
-
-    @contextmanager
-    def local(self, path: str) -> Iterator[Path]: ...             # a real folder for path, for code that needs one
+    def write(self, path, data: bytes) -> None: ...
+    def read(self, path) -> bytes: ...
+    def exists(self, path) -> bool: ...
+    def list(self, prefix) -> list[str]: ...
+    def append(self, path, data: bytes) -> None: ...        # safe for concurrent writers
+    def local(self, path) -> ContextManager[Path]: ...       # a real folder, for programs that need one
+    def lock(self, name) -> ContextManager[None]: ...        # across processes; RunBusy if held
 ```
 
-`local` exists because evaluators and agents run programs that need a real folder. A
-`DirectoryStorage` returns the folder itself. A remote storage downloads what's there into a
-temporary folder, and uploads it again when the block ends.
+`DirectoryStorage(dir)` and `MemoryStorage()` ship today; remote storages are on the README's
+list. Everything above `Storage` picks its own paths:
 
-| Backend | `append` | `local` |
-| --- | --- | --- |
-| `DirectoryStorage("runs/mar5")` | appends to the file, under a file lock | the folder itself |
-| `MemoryStorage()` | appends to bytes in a dict | a temporary folder, read back at the end |
-| `S3Storage("s3://bucket/runs/mar5")` (later) | one new object per call, under `path/`; `read` joins them in order | download, then upload |
-| `ModalStorage(volume)` (later) | appends to the file on the mounted volume | the folder on the volume |
-
-Everything above `Storage` picks its own path and format:
-
-```
-runs/mar5/
-  history/records.jsonl      evokit.history: one JSON record per line
-  archive/changes.jsonl      the Archive base class: one change per line
-  blobs/ab/cdef...           genome encoding: content-addressed, so equal content is stored once
-  artifacts/<id>/            tell: the evaluation's logs (Evaluation.logs);
-                             ask: the operator's logs for the child (agent.jsonl: the agent's session)
-  failed/<id>/               ask: the logs of an operator call that failed (its note names the folder)
+```text
+experiments/0/
+  history/records.jsonl    the history: one record per line (created, evaluated, discarded, note)
+  archive/changes.jsonl    the archive's own change log
+  archive.pickle           the archive with no members, so open_experiment can rebuild it
+  task.json                which task folder the experiment belongs to
+  blobs/ab/cdef...         genome contents, content-addressed, so equal content is stored once
+  artifacts/<id>/          an evaluation's logs (Evaluation.logs, files written to $EVOKIT_WORKDIR)
+  failed/<id>/             the logs of a variation that failed (its note names the folder)
+  sessions/<session>/      agents' transcripts, one file per turn
+  env/                     the task's fixed files, snapshotted once (experiments made from the CLI)
 ```
 
-Individuals are saved with `encode(individual, storage)` and `decode(data, storage)`. A genome
-is any JSON value, or any type with `to_json(put_blob)` and `from_json(data, get_blob)`, where
-`put_blob` writes to `blobs/` under its content hash. That covers a string, a whole repository
-as `Files`, a model checkpoint. The storage never knows which.
-
-## History
-
-The history of a run is written inside the functions that make it, so a recipe never records
-anything by hand:
-
-- `ask` records the children it creates and the operator calls that fail, with their cost.
-- `tell` records each evaluated individual, and whether the archive admitted it.
-
-It is read through functions in `evokit.history`:
-
-```python
-from evokit import history
-
-history.usage(storage)              # Counter: cost_usd, tokens, ...: the sum over everything recorded
-history.counts(storage)             # Counter: "created", "evaluated", "added", and each note kind
-history.evaluated(storage)          # everything evaluated so far, in order, with their evaluations
-history.admitted(storage)           # the ones the archive admitted at the time
-history.pending(storage)            # created, but not yet evaluated or discarded
-history.individual(storage, id)
-history.last_note(storage, kind)
-history.records(storage)            # everything, for tools like compare.py
-```
-
-A recipe writes to the history in only two cases:
-
-```python
-history.note(storage, kind, text="", usage=None)     # anything else worth keeping: a redirect, a summary, an LLM judge's cost
-history.discard(storage, individual, reason)         # created, but will not be evaluated
-```
-
-The functions keep running totals in memory, so a recipe can check its budget every iteration
-without reading the whole log again.
-
-**Every cost is in the history.** Creating a child, evaluating it, a failed operator call and
-a note all record their own cost. So `history.usage(storage)["cost_usd"]` is always the cost of
-the whole run, without a counter in the recipe.
-
-**Children are recorded when they are created, before they are evaluated.** After a crash,
-`ask` hands them back first, so their creation cost isn't paid twice.
-
-## The functions
-
-```python
-async def ask(storage, archive, strategy, operator, n=1) -> Asked:
-    """Up to n individuals to evaluate. Children a crash left unevaluated come first; otherwise select n
-    times and create from each selection. Every creation and failure is recorded with its cost."""
-    if pending := history.claim_pending(storage, n):
-        return Asked(tuple(pending))
-    selections = await strategy.select(archive, n)
-    if not selections:
-        return Asked((), exhausted=True)
-    individuals, failures = [], []
-    for selection in selections:
-        try:
-            offspring = await operator.create(selection, archive)
-        except OperatorError as exc:
-            failures.append(Failure(selection, exc.reason, exc.usage))
-            history.note(storage, "failed", exc.reason, exc.usage)
-            continue
-        history.record_created(storage, offspring.children, tuple(p.id for p in selection.parents), offspring.usage)
-        individuals += offspring.children
-    return Asked(tuple(individuals), tuple(failures))
-
-
-def eval_fn(fn=None, *, timeout=None, executor=None):
-    """Make fn(individual) -> Evaluation, sync or async, async and never raising."""
-    def wrap(fn):
-        async def wrapped(individual):
-            try:
-                call = fn(individual) if is_async(fn) else loop.run_in_executor(executor, fn, individual)
-                evaluation = await asyncio.wait_for(call, timeout)
-            except asyncio.TimeoutError:
-                return Evaluation(feedback=f"evaluation timed out after {timeout}")
-            except Exception:
-                return Evaluation(feedback=traceback.format_exc())
-            return evaluation
-        return wrapped
-    return wrap if fn is None else wrap(fn)
-
-
-async def tell(storage, archive, individuals, evaluations) -> list[Individual]:
-    """Give each individual its evaluation, store its logs, add it to the archive and record it.
-    Returns the ones the archive admitted."""
-    admitted = []
-    for individual, evaluation in zip(individuals, evaluations, strict=True):
-        write_logs(storage, f"artifacts/{individual.id}", evaluation.logs)
-        individual = individual.with_evaluation(replace(evaluation, logs={}))
-        added = archive.add(individual)
-        history.record_evaluated(storage, individual, added=added)
-        if added:
-            admitted.append(individual)
-    return admitted
-
-```
-
-`history.record_created`, `history.record_evaluated` and `history.claim_pending` are how these
-functions write the history. A recipe only calls them if it replaces `ask` or `tell`.
-
-A recipe takes its input and returns its output. Three things are not the algorithm's job:
-
-- **The starting individuals.** The caller puts them in the archive, with the same functions:
-
-  ```python
-  archive = BestArchive(storage=storage)
-  if not archive.members():                                   # a fresh run; a continued one restores itself
-      seed = Individual.new(project.seed_genome())
-      await evokit.tell(storage, archive, [seed], [await score(seed)])
-  ```
-
-  `tell` only needs an evaluation, not where it came from. A seed whose score is already known,
-  such as a published baseline, is never evaluated:
-
-  ```python
-  await evokit.tell(storage, archive, [Individual.new(genome)], [Evaluation({"score": 0.52})])
-  ```
-
-- **Continuing a stopped run.** An archive built with `storage=` restores itself. The recipe
-  never knows whether it is continuing.
-- **Running several attempts at once.** That is `asyncio.gather` over copies of the loop. The
-  archive already has members when the recipe starts, so no worker starts on an empty archive.
-
-A recipe that needs something unusual between selecting and creating calls `strategy.select`
-and `operator.create` itself, then `history.record_created`. `ask` is only those calls plus the
-recording.
-
-## What goes away
-
-| Today | Here |
-| --- | --- |
-| `Experiment` with `ask` / `tell` / `run(workers, max_*)` | `evokit.ask`, an `@evokit.eval_fn`, `evokit.tell`, and a loop (`asyncio.gather` for several workers) |
-| `ask() -> Individual \| None`, `tell(individual) -> Individual` | `ask` returns `Asked`; `tell` returns the admitted individuals |
-| `transaction`, `_encode`, `keep=`, `state_dict` on components | the history log; archives built with `storage=` save and restore themselves |
-| `Fitness(status, objectives, constraints, feedback, usage)` and `.ok` | `Evaluation(objectives, feedback, usage)`: no objectives means it failed |
-| `_charge`, `_used`, the discard streak, `in_flight` | `history.usage(storage)` and `history.counts(storage)` |
-| the queue of extra children, the seed counter, `_seeds_in_flight`, the select lock | `ask` hands back unevaluated children first; the caller seeds the archive before the recipe starts |
-| `create_individuals(selected, archive) -> list`, with cost on `children[0].info` | `create(selection, archive) -> Offspring` |
-| `select_individuals(archive, n) -> list[tuple]` | `select(archive, n) -> list[Selection]`, with parents and inspirations kept apart |
-| `strategy.tell` / `operator.tell` | none: strategies read the archive; recipes derive any other state from the storage |
-| migration inside `IslandArchive.add` | `IslandArchive.migrate(top)`, called by the recipe |
-| recipes as configuration of `Experiment` | recipes as loops: copy one to change it |
+A genome is any JSON value, or any type with `to_json(put_blob)` and `from_json(data, get_blob)`,
+where `put_blob` writes to `blobs/` under the content's hash. That covers a string, a vector, a
+whole repository as `Files`. The storage never knows which.
 
 ## Open questions
 
-- **The CLI rebuilds a run's components from its task folder.** The first command on a run
-  directory (with `--task`) saves the folder at `run/task.json`, and every later command calls
-  `load_task(folder).open(storage)` again (see [tasks.md](tasks.md)). So the CLI can run the
-  generic loop (`evokit run`) but not a recipe's own loop. A `run: {recipe: avo}` key could
-  name one.
-- **Several processes on one run.**
-  - Each backend's `append` must be safe when two processes append at once: a file lock for
-    `DirectoryStorage`, one object per append for S3.
-  - `claim_pending` must claim in storage, not in memory.
-  - A process must read new records before it selects.
-- **A sandbox.** Self-modifying agents run code they wrote themselves. The same sandbox should
-  wrap both `eval_fn` and the agents inside operators, for example
-  `CommandAgent(..., sandbox=Docker(image))`.
-- **Re-evaluation.** Two cases need it: noisy benchmarks, and re-running archived agents on a
-  new domain, as Hyperagents does to measure transfer. `tell` should accept an
-  already-archived individual with a new evaluation, so `archive.add` replaces it and the storage
-  records a second `Evaluated` for the same id.
+The README's TODO list has the open design work: several processes on one experiment, a sandbox
+for agents and evaluators, re-evaluation, evaluation caching, sampling that sees what is in
+flight, remote storages and multi-objective archives.

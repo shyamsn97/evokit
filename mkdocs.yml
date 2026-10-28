@@ -1,14 +1,36 @@
-# site_name: REPLACE_evokit
-# copyright: Copyright (c) 2023-present REPLACE_FULL_NAME <REPLACE_EMAIL>
+site_name: EvoKit
+site_description: Evolutionary search where the variation operator can be a coding agent.
+repo_url: https://github.com/shyamsn97/evokit
+repo_name: shyamsn97/evokit
+edit_uri: edit/main/docs/
+copyright: Copyright (c) 2026 Shyam Sudhakaran
 
+nav:
+  - Home: index.md
+  - Primitives: primitives.md
+  - Recipes:
+      - recipes.md
+      - autoresearch: recipes/autoresearch.md
+      - AVO: recipes/avo.md
+      - OpenEvolve: recipes/openevolve.md
+      - ShinkaEvolve: recipes/shinka.md
+      - Darwin Gödel Machine: recipes/dgm.md
+      - DGM-Hyperagents: recipes/hyperagents.md
+      - A generational GA: recipes/ga.md
+      - EvoRLM (experimental): recipes/evorlm.md
+  - Tasks: tasks.md
+  - Reading runs: reading-runs.md
 
-# mkdocs.yml
-site_name: evokit Docs
+# Working notes from earlier designs; their code no longer matches the library.
+exclude_docs: |
+  research/
+  design/
+  examples/
+  references/
 
 theme:
   name: material
   features:
-    - announce.dismiss
     - content.action.edit
     - content.action.view
     - content.code.annotate
@@ -22,7 +44,6 @@ theme:
     - search.share
     - search.suggest
     - toc.follow
-    - tabs
   palette:
     - scheme: default
       primary: indigo
@@ -41,10 +62,7 @@ theme:
     code: Roboto Mono
 
 plugins:
-  - mkdocs-jupyter
   - search
-  - literate-nav
-  - mkdocstrings
 
 markdown_extensions:
   - pymdownx.highlight
@@ -55,5 +73,6 @@ markdown_extensions:
       check_paths: true
   - admonition
   - def_list
+  - tables
   - toc:
       permalink: "#"
