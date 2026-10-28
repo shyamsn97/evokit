@@ -22,11 +22,9 @@ from pathlib import Path
 
 import evokit as ek
 from evokit import recipes
-from evokit.archives import BestArchive, IslandArchive
 from evokit.agents import ClaudeCode, ReplAgent
-from evokit.files import with_lines
+from evokit.archives import BestArchive
 from evokit.operators import OpenAIModel
-from evokit.storages import DirectoryStorage
 
 from heldout import print_rows, test_run
 
@@ -63,16 +61,6 @@ def agent(spec: str, long: bool):
     raise SystemExit(f"unknown agent {spec!r}: use claude or repl:MODEL")
 
 
-async def seed(history, archive, genome, eval_fn) -> None:
-    if archive.members():
-        return
-    first = ek.Individual.new(genome, name="seed")
-    evaluation = await ek.as_eval_fn(eval_fn)(first)
-    await ek.tell(history, archive, [first], [evaluation])
-    if not archive.members():
-        raise SystemExit(f"the seed failed its evaluation:\n{evaluation.feedback[:2000]}")
-
-
 async def run(
     problem: str,
     algorithm: str,
@@ -88,48 +76,16 @@ async def run(
         raise SystemExit(
             f"no task folder {folder.relative_to(HERE)}; run `python setup.py` first"
         )
-    storage = DirectoryStorage(directory)
-    history = ek.History(storage)
-    task = ek.load_task(folder, environment=Path(storage.root) / "env")
-    common = dict(
-        history=history, instructions=task.instructions, max_evaluations=max_evaluations
-    )
+    # heldout.py scores the best solve.py with the experiment's own copy of evaluate.py, in <dir>/env
+    task = ek.Task.from_directory(folder, environment=Path(directory) / "env")
+    limits = dict(max_evaluations=max_evaluations, max_cost=max_cost)
     if algorithm == "autoresearch":
-        archive = BestArchive("score", storage=storage)
-        await seed(history, archive, task.project.seed_genome(), task.eval_fn)
-        await recipes.autoresearch(
-            task.project,
-            task.eval_fn,
-            agent(agent_spec, long=False),
-            archive=archive,
-            objective="score",
-            results=Path(storage.root) / "results.tsv",
-            **common,
-        )
+        archive = BestArchive()
+        await recipes.autoresearch(task, agent(agent_spec, long=False), dir=directory, archive=archive, **limits)
     elif algorithm == "avo":
-        archive = BestArchive("score", ties="accept", storage=storage)
-        await seed(history, archive, task.project.seed_genome(), task.eval_fn)
-        await recipes.avo(
-            task.project,
-            task.eval_fn,
-            agent(agent_spec, long=True),
-            archive=archive,
-            max_cost=max_cost,
-            **common,
-        )
+        await recipes.avo(task, agent(agent_spec, long=True), dir=directory, **limits)
     else:
-        eval_fn = with_lines(task.eval_fn)
-        archive = IslandArchive(storage=storage)
-        await seed(history, archive, task.project.seed_genome(), eval_fn)
-        await recipes.openevolve(
-            task.project,
-            eval_fn,
-            {"main": openai_model(model)},
-            archive=archive,
-            workers=workers,
-            max_cost=max_cost,
-            **common,
-        )
+        await recipes.openevolve(task, {"main": openai_model(model)}, dir=directory, workers=workers, **limits)
 
 
 def main() -> None:
@@ -141,7 +97,7 @@ def main() -> None:
     )
     parser.add_argument("--algorithm", choices=ALGORITHMS, default="autoresearch")
     parser.add_argument(
-        "--dir", required=True, help="run directory (continues the run if it exists)"
+        "--dir", required=True, help="experiment directory (continues it if it exists)"
     )
     parser.add_argument(
         "--agent", default="claude", help="claude or repl:MODEL (autoresearch, avo)"

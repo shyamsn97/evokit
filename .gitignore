@@ -62,6 +62,7 @@ runs/
 
 # Internal docs: proposals, superseded designs, surveys, plans
 docs/research/
+docs/design/
 
 # CO-Bench data and generated task folders (examples/co_bench/setup.py)
 examples/co_bench/data/

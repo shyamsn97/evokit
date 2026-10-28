@@ -7,18 +7,21 @@ import copy
 import json
 import logging
 import os
-import tempfile
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
-from evokit.agents.base import AgentResult, CodingAgent, kill
+from evokit.agents.harness import Agent, Turn, kill, scratch
 from evokit.errors import UsageError
 from evokit.util import parse_duration, reaped, spawned, truncate
 
 log = logging.getLogger("evokit")
 
+NO_SHELL = ("Read", "Edit", "Write", "Glob", "Grep", "Bash(evokit *)")
+"""`allowed_tools` for an agent that only reads and edits files and calls its session's tools (the
+`evokit` command): it cannot run other commands, so it cannot run code except through those tools."""
 
-class ClaudeCode(CodingAgent):
+
+class ClaudeCode(Agent):
     """Headless Claude Code (`claude -p --output-format stream-json`), resumable with `--resume`.
 
     The final `result` event is the answer. Claude Code can stay alive after printing it, so the
@@ -26,10 +29,13 @@ class ClaudeCode(CodingAgent):
 
     `auth="env"` runs it with the environment as it is, so an ANTHROPIC_API_KEY there takes
     precedence; `auth="login"` removes that key, so Claude Code uses its own login.
+
+    `allowed_tools` (Claude Code tool rules, e.g. `NO_SHELL`) limits it to those tools: every
+    other call is denied (`--permission-mode dontAsk`). None: every tool, as `permission_mode` says.
     """
 
     exit_grace = 30.0
-    on_cost: Callable[[float | None], None] | None = None
+    takes_system = True
 
     def __init__(
         self,
@@ -41,12 +47,14 @@ class ClaudeCode(CodingAgent):
         extra_args: Sequence[str] = (),
         binary: str = "claude",
         auth: Literal["env", "login"] = "env",
+        allowed_tools: Sequence[str] | None = None,
     ):
         if auth not in ("env", "login"):
             raise ValueError(f"auth must be 'env' or 'login', not {auth!r}")
         self.model, self.max_turns, self.permission_mode = model, max_turns, permission_mode
         self.max_budget_usd, self.timeout = max_budget_usd, parse_duration(timeout)
         self.extra_args, self.binary, self.auth = list(extra_args), binary, auth
+        self.allowed_tools = None if allowed_tools is None else list(allowed_tools)
 
     def environment(self, env: Mapping[str, str]) -> dict[str, str]:
         environment = {**os.environ, **env}
@@ -54,43 +62,33 @@ class ClaudeCode(CodingAgent):
             environment.pop("ANTHROPIC_API_KEY", None)
         return environment
 
-    def with_budget(self, usd: float | None) -> "ClaudeCode":
-        """A copy whose `--max-budget-usd` is at most `usd`."""
-        if usd is None:
-            return self
-        agent = copy.copy(self)
-        agent.max_budget_usd = usd if self.max_budget_usd is None else min(usd, self.max_budget_usd)
-        return agent
-
-    def with_meter(self, on_cost: Callable[[float | None], None]) -> "ClaudeCode":
-        """A copy that reports its cost after every API message (see `_CostMeter`)."""
-        agent = copy.copy(self)
-        agent.on_cost = on_cost
-        return agent
-
     async def check(self) -> None:
         """One one-turn call with these settings (binary, model, auth); its cost is not recorded."""
         probe = copy.copy(self)
         probe.max_turns = 1
-        with tempfile.TemporaryDirectory(prefix="evokit-check-") as directory:
-            result = await probe.run(Path(directory), "Reply with OK.")
+        async with scratch(probe) as session:
+            result = await session.prompt("Reply with OK.")
         if result.error:
             raise UsageError(
                 f"Claude Code cannot run: {result.error}",
                 hint=f"try `{self.binary} -p hi` in this shell; check the model ({self.model or 'default'}) and auth ({self.auth})",
             )
 
-    def argv(self, prompt: str, session: str | None) -> list[str]:
+    def argv(self, prompt: str, session: str | None, budget: float | None = None, system: str | None = None) -> list[str]:
         argv = [self.binary, "-p", prompt, "--output-format", "stream-json", "--verbose", "--max-turns", str(self.max_turns)]
-        argv += ["--permission-mode", self.permission_mode]
+        if self.allowed_tools is None:
+            argv += ["--permission-mode", self.permission_mode]
+        else:
+            argv += ["--permission-mode", "dontAsk", "--allowedTools", ",".join(self.allowed_tools)]
         if self.model:
             argv += ["--model", self.model]
-        if self.max_budget_usd is not None:
-            argv += ["--max-budget-usd", str(self.max_budget_usd)]
+        budgets = [b for b in (self.max_budget_usd, budget) if b is not None]
+        if budgets:
+            argv += ["--max-budget-usd", str(min(budgets))]
+        if system:
+            argv += ["--append-system-prompt", system]
         if session:
             argv += ["--resume", session]
-        if self.on_cost is not None:
-            argv += ["--include-partial-messages"]
         return argv + self.extra_args
 
     async def _exec(
@@ -111,7 +109,6 @@ class ClaudeCode(CodingAgent):
         spawned(proc)
         stderr = asyncio.create_task(proc.stderr.read())
         data: dict = {}
-        meter = _CostMeter()
 
         async def result_event() -> dict:
             async for line in proc.stdout:
@@ -119,10 +116,6 @@ class ClaudeCode(CodingAgent):
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     event = None
-                if isinstance(event, dict) and event.get("type") == "stream_event":
-                    if self.on_cost is not None and meter.update(event.get("event") or {}):
-                        self.on_cost(meter.cost())
-                    continue
                 transcript.append(line.decode(errors="replace"))
                 if not isinstance(event, dict):
                     continue
@@ -146,15 +139,14 @@ class ClaudeCode(CodingAgent):
             reaped(proc)
         return proc.returncode, data, (await stderr).decode(errors="replace")
 
-    async def _run(self, directory, prompt, session=None, env=None) -> AgentResult:
+    async def _run(self, cwd, prompt, session, env, budget, system=None) -> Turn:
         lines: list[str] = []
         try:
-            code, data, err = await self._exec(self.argv(prompt, session), Path(directory), env or {}, lines)
+            code, data, err = await self._exec(self.argv(prompt, session, budget, system), Path(cwd), env, lines)
         except asyncio.TimeoutError:
-            return AgentResult("", error=f"claude timed out after {self.timeout:.0f}s", transcript="".join(lines) or None)
+            return Turn("", error=f"claude timed out after {self.timeout:.0f}s", transcript="".join(lines) or None, session=session)
         except FileNotFoundError:
-            return AgentResult("", error=f"{self.binary!r} not found; install Claude Code or pass binary=")
-        _learn_rates(data.get("modelUsage"))
+            return Turn("", error=f"{self.binary!r} not found; install Claude Code or pass binary=")
         usage_raw = data.get("usage") or {}
         tokens = sum(
             int(usage_raw.get(k, 0) or 0)
@@ -168,64 +160,14 @@ class ClaudeCode(CodingAgent):
         if data.get("is_error") or subtype.startswith("error") or not data:
             reason = data.get("result") or (subtype if subtype.startswith("error") else "") or err.strip()
             error = truncate(reason or f"claude printed no result (exit code {code})", 2000)
-        return AgentResult(
-            summary=data.get("result") or "",
+        return Turn(
+            text=data.get("result") or "",
             usage=usage,
-            session=data.get("session_id"),
+            session=data.get("session_id") or session,
             trace=truncate(err, 4000) if err else None,
             error=error,
             transcript="".join(lines) or None,
         )
-
-
-_RATES: dict[str, float] = {}
-"""USD per input token for each model, as Claude Code charged it in a finished run (its result's
-`modelUsage`); `ClaudeCode.check()` teaches the run's model before a loop starts."""
-
-
-def _weight(input_tokens, output_tokens, cache_writes, cache_reads) -> float:
-    """Tokens in input-token units: Anthropic's prices are in these ratios for every model."""
-    return (input_tokens or 0) + 5 * (output_tokens or 0) + 1.25 * (cache_writes or 0) + 0.1 * (cache_reads or 0)
-
-
-def _learn_rates(model_usage) -> None:
-    for model, u in (model_usage or {}).items():
-        weight = _weight(u.get("inputTokens"), u.get("outputTokens"), u.get("cacheCreationInputTokens"), u.get("cacheReadInputTokens"))
-        if weight > 0 and u.get("costUSD") is not None:
-            _RATES[model] = float(u["costUSD"]) / weight
-
-
-class _CostMeter:
-    """A Claude Code run's cost so far, from each API message's token counts (with
-    --include-partial-messages: `message_start`, and `message_delta` for the final output tokens),
-    at the rates in `_RATES`. Exact for the agent's own messages; Claude Code's small background
-    calls (e.g. Haiku, 1-2% of a session) are not in the stream and only show in the result."""
-
-    def __init__(self):
-        self.messages: dict[str, tuple[str, dict]] = {}
-        self.current: str | None = None
-
-    def update(self, event: dict) -> bool:
-        """True if the cost may have changed."""
-        if event.get("type") == "message_start":
-            message = event.get("message") or {}
-            self.current = message.get("id")
-            self.messages[self.current] = (message.get("model", ""), dict(message.get("usage") or {}))
-            return True
-        if event.get("type") == "message_delta" and self.current in self.messages:
-            self.messages[self.current][1].update(event.get("usage") or {})
-            return True
-        return False
-
-    def cost(self) -> float | None:
-        total = 0.0
-        for model, u in self.messages.values():
-            if model not in _RATES:
-                return None
-            total += _RATES[model] * _weight(
-                u.get("input_tokens"), u.get("output_tokens"), u.get("cache_creation_input_tokens"), u.get("cache_read_input_tokens")
-            )
-        return total
 
 
 _TOOL_ARGUMENT = ("file_path", "command", "pattern", "path", "url", "query", "description")

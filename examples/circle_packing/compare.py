@@ -6,7 +6,7 @@
 
 An arm is ALGORITHM or ALGORITHM:VARIANT; its runs go to runs/<algorithm>[-<variant>]-<k>
 (autoresearch runs unattended here; an interactive run belongs in runs/autoresearch-external-<k>).
-The report reads each run's history (evokit.History.records): the best admitted score at
+The report reads each experiment's history (evokit.Experiment.records): the best admitted score at
 fractions of the dollar budget (per algorithm, since DGM scores agents and the others score
 packings), plus final cost, evaluations, and wall time. Interactive runs (an outside
 agent as the operator) do not report their model cost; pass it with --external-cost.
@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from evokit.history import LOG, History
+from evokit.experiment import LOG, Experiment
 from evokit.storages import DirectoryStorage
 
 HERE = Path(__file__).resolve().parent
@@ -54,7 +54,7 @@ def run_arms(arms: list[str], repeats: int, out: Path, max_cost: float | None) -
 
 
 def curve(run_dir: Path, extra_cost: float | None) -> dict:
-    records = History(DirectoryStorage(run_dir)).records()
+    records = Experiment(DirectoryStorage(run_dir)).records()
     start = records[0]["time"] if records else 0.0
     best, points, kept, told, cost = None, [], 0, 0, 0.0
     for record in records:

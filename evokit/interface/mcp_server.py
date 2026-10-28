@@ -1,16 +1,16 @@
-"""`evokit mcp`: the same @command registry served as MCP tools over stdio."""
+"""`evokit mcp`: the experiment's commands (`experiment_tools`) served as MCP tools over stdio."""
 
 from __future__ import annotations
 
 import inspect
 import json
-from typing import TYPE_CHECKING, Any, Callable
+import typing
+from typing import Any, Callable
 
+from evokit.agents.tools import parameters, tool_doc
 from evokit.errors import EvoError, UsageError
-from evokit.interface.commands import Command, commands_of, component_commands
-
-if TYPE_CHECKING:
-    from evokit.interface.setup import Setup
+from evokit.agents.tools import encode
+from evokit.interface.commands import experiment_tools
 
 
 def _tool_error() -> type[Exception]:
@@ -24,24 +24,29 @@ def _tool_error() -> type[Exception]:
     return ToolError
 
 
-def _tool(cmd: Command, setup: "Setup") -> Callable | None:
-    from evokit.interface.cli import cli_params, resolve_arguments
-
-    params = cli_params(cmd.func)
-    if params is None:
-        return None
+def _mcp_tool(name: str, fn: Callable, release: Callable[[], None]) -> Callable:
+    """`fn` (a command bound to its experiment) as a plain function MCP can describe: keyword
+    arguments, JSON results, errors as ToolError. `release` gives the experiment back after each
+    call, so the server never keeps other processes from driving it."""
     tool_error = _tool_error()
+    params = [p.replace(kind=inspect.Parameter.KEYWORD_ONLY) for p in parameters(fn)]
+    try:
+        hints = typing.get_type_hints(inspect.unwrap(getattr(fn, "func", fn)))
+    except Exception:
+        hints = {}
 
     def tool(**kwargs) -> Any:
         try:
-            return cmd.shape(cmd.func(**resolve_arguments(cmd.func, setup, kwargs)))
+            return encode(fn(**kwargs))
         except EvoError as exc:
             raise tool_error(json.dumps(exc.to_dict())) from exc
+        finally:
+            release()
 
-    tool.__signature__ = inspect.Signature([p.replace(kind=inspect.Parameter.KEYWORD_ONLY) for p in params])
-    tool.__annotations__ = {p.name: p.annotation for p in params}
-    tool.__name__ = cmd.name.replace("-", "_")
-    tool.__doc__ = cmd.doc
+    tool.__signature__ = inspect.Signature([p.replace(annotation=hints.get(p.name, p.annotation)) for p in params])
+    tool.__annotations__ = {p.name: hints.get(p.name, p.annotation) for p in params}
+    tool.__name__ = name.replace("-", "_")
+    tool.__doc__ = tool_doc(fn)
     return tool
 
 
@@ -53,18 +58,14 @@ def build_server(directory: str, task: str | None = None):
             from mcp.server.fastmcp import FastMCP  # mcp 1.x
         except ImportError as exc:
             raise UsageError("the MCP server needs the `mcp` package", hint="pip install 'evokit[mcp]'") from exc
-    from evokit.interface.setup import open_setup
+    from evokit.interface.cli import experiment_for
     from evokit.interface.skill import render_skill
 
-    setup = open_setup(directory, task)
-    server = FastMCP("evokit", instructions=render_skill(setup, "mcp"))
-    cmds = [(c.name.replace("-", "_"), c) for obj in setup.objects for c in commands_of(obj, "mcp")]
-    for slot, extra in component_commands(setup.objects, "mcp").items():
-        cmds += [(f"{slot}_{c.name.replace('-', '_')}", c) for c in extra]
-    for name, cmd in cmds:
-        tool = _tool(cmd, setup)
-        if tool is not None:
-            server.add_tool(tool, name=name, description=cmd.doc)
+    experiment = experiment_for(directory, task)
+    server = FastMCP("evokit", instructions=render_skill(experiment, "mcp"))
+    for name, fn in experiment_tools(experiment).items():
+        tool = _mcp_tool(name, fn, experiment.close)
+        server.add_tool(tool, name=tool.__name__, description=tool.__doc__)
     return server
 
 

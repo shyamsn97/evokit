@@ -89,6 +89,18 @@ class Project:
         shutil.copytree(self.environment, directory, dirs_exist_ok=True)
         genome.write_to(directory)
 
+    def checkout(self, genome: Files, directory: str | Path) -> Path:
+        """`directory`, emptied, then holding the full project with `genome`: where an agent works."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        for child in directory.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        self.write(genome, directory)
+        return directory
+
     def read(self, directory: str | Path) -> Files:
         """The genome files in `directory`. Raises EnvironmentModified if environment files were edited."""
         files, modified = {}, []

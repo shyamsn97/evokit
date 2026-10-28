@@ -2,7 +2,7 @@
 
 Everything above it picks its own path and format:
 
-    history/records.jsonl      evokit.history
+    history/records.jsonl      evokit.run
     archive/changes.jsonl      the Archive base class
     blobs/ab/cdef...           genome contents, content-addressed
     artifacts/<id>/            each individual's evaluation folder, through `local`
@@ -52,10 +52,15 @@ class Storage(ABC):
         """A real folder holding what is stored under `path`, for code that needs one. What is in the
         folder when the block ends is what is stored under `path`."""
 
+    @property
+    def key(self) -> str:
+        """Names this run's storage, the same for every Storage object on it in one process."""
+        return f"{type(self).__name__}:{id(self)}"
+
     @abstractmethod
     def lock(self, name: str) -> AbstractContextManager[None]:
         """Held by one holder at a time, across processes. Raises RunBusy at once if another holder
-        has it; loops take lock("driver") so only one process drives a run."""
+        has it; a Run takes lock("driver") on its first write, so only one process drives a run."""
 
 
 def check_path(path: str) -> str:

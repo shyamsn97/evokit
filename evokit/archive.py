@@ -3,19 +3,24 @@
 Every archive has members by id, metadata per member (any JSON: an island and a cell, a
 behaviour descriptor, a novelty score) and state of its own (any JSON: a threshold, a counter).
 A subclass writes `add`, its rule for who gets in, and changes the archive only through
-`insert`, `remove` and `set_state`. With a storage, the base class appends each change to
-`<name>/changes.jsonl`, and an archive built on an existing run replays that log, so it comes
-back exactly as it was.
+`insert`, `remove` and `set_state`. An experiment attaches its archive to its storage: from then
+on the base class appends each change to `<name>/changes.jsonl`, and an archive attached to an
+existing experiment replays that log, so it comes back exactly as it was.
+
+`sample(n, strategy)` picks members for a recipe (parents, inspirations): the archive offers its
+candidates and the strategy (see `evokit.strategies`) picks among them; `top(n)` gives the best.
 """
 
 from __future__ import annotations
 
+import random
 import time
 from abc import ABC, abstractmethod
 from typing import Any
 
 from evokit.records import Individual
 from evokit.storage import Storage, append_json, decode, encode, read_json_lines
+from evokit.strategies import Strategy, uniform
 
 
 def _replay(storage: Storage, log: str) -> tuple[dict[str, Individual], dict[str, dict], dict[str, Any]]:
@@ -41,14 +46,29 @@ def read_members(storage: Storage, name: str = "archive") -> dict[str, Individua
 
 
 class Archive(ABC):
-    def __init__(self, storage: Storage | None = None, name: str = "archive"):
-        self.storage = storage
+    strategy: Strategy = staticmethod(uniform)
+    """What `sample` uses when it is given no strategy."""
+
+    def __init__(self, name: str = "archive", seed: int | None = None):
+        self.name = name
+        self.storage: Storage | None = None
         self.log = f"{name}/changes.jsonl"
         self._members: dict[str, Individual] = {}
         self.metadata: dict[str, dict] = {}
         self.state: dict[str, Any] = {}
-        if storage is not None:
+        self.rng = random.Random(seed)
+
+    def attach(self, storage: Storage, objective: str = "score", minimize: bool = False) -> None:
+        """Keep the archive in `storage` from now on, restoring what its log there holds. An
+        archive that ranks gets the task's `objective` and `minimize` unless it was given its own."""
+        if self.storage is not None and self.storage is not storage:
+            raise ValueError("this archive already belongs to another experiment")
+        self.storage = storage
+        if storage.exists(self.log):
             self._members, self.metadata, self.state = _replay(storage, self.log)
+        else:
+            for individual in list(self._members.values()):
+                self._append({"inserted": encode(individual, storage), "metadata": self.metadata[individual.id]})
 
     @abstractmethod
     def add(self, individual: Individual) -> bool:
@@ -79,8 +99,34 @@ class Archive(ABC):
     def get(self, id: str) -> Individual | None:
         return self._members.get(id)
 
+    def candidates(self) -> list[Individual]:
+        """What `sample` picks from: every member (best first, in an archive that ranks)."""
+        return self.members()
+
+    def sample(self, n: int = 1, strategy: Strategy | None = None) -> list[Individual]:
+        """Up to `n` members, picked by `strategy` (default: the archive's own) from its candidates."""
+        candidates = self.candidates()
+        if not candidates:
+            return []
+        return list((strategy or self.strategy)(candidates, n, self))
+
+    def top(self, n: int = 1) -> list[Individual]:
+        """The `n` best members; for an archive that does not rank, the newest."""
+        return list(reversed(self.members()))[:n]
+
     def __len__(self) -> int:
         return len(self._members)
 
     def __contains__(self, id: str) -> bool:
         return id in self._members
+
+
+def improves(archive: Archive, individual: Individual, best: Individual | None) -> bool:
+    """Whether `individual` (evaluated) strictly beats `best`, by the archive's own ranking."""
+    score, better = getattr(archive, "score", None), getattr(archive, "better", None)
+    if score is not None and better is not None:
+        new = score(individual)
+        old = score(best) if best is not None else None
+        return new is not None and (old is None or better(new, old))
+    after = archive.best() if hasattr(archive, "best") else None
+    return after is not None and after.id == individual.id and (best is None or best.id != individual.id)

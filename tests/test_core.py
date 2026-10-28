@@ -1,16 +1,13 @@
-"""The core: storage, history, archives, strategies, operators and ask/evaluate/tell, without files."""
+"""The core: storage, experiments, archives, strategies, variation functions and create/submit, without files."""
 
 import asyncio
-import functools
 import json
-import math
 import os
 import time
 
 import pytest
 
 import evokit as ek
-from evokit.history import History
 from evokit.archives import (
     BestArchive,
     IslandArchive,
@@ -20,16 +17,11 @@ from evokit.archives import (
     SimplerBestArchive,
     UnboundedArchive,
 )
-from evokit.operators import Choice, FunctionModel, TextRewriteOperator
+from evokit.operators import FunctionModel, rewrite_text
+from evokit.recipes import islands, proportional
 from evokit.storage import decode, encode
 from evokit.storages import DirectoryStorage, MemoryStorage
-from evokit.strategies import Greedy, IslandSampler, ProportionalSelection, Tournament
-
-
-@functools.cache
-def history_of(storage) -> History:
-    """One History per storage, as a process keeps one per run."""
-    return History(storage)
+from evokit.strategies import best, tournament
 
 
 def scored(genome, score, parents=(), **objectives):
@@ -41,21 +33,33 @@ def closeness(individual):
 
 
 def bump(step=1.0):
-    return ek.Mutate(lambda x: x + step)
+    async def bumped(parent):
+        return ek.Individual.new(parent.genome + step, [parent.id], {"operator": "bump"}), {}
+
+    return bumped
 
 
-async def seeded(storage, archive, *genomes, eval_fn=closeness):
-    seeds = [ek.Individual.new(g) for g in genomes]
-    await ek.tell(history_of(storage), archive, seeds, await asyncio.gather(*map(ek.as_eval_fn(eval_fn), seeds)))
-    return archive
+def experiment(seed=0.0, evaluate=closeness, archive=None, dir=None, **limits) -> ek.Experiment:
+    """A new experiment on Task(seed, evaluate), seeded."""
+    return ek.Task(seed, evaluate).create_experiment(dir, archive=archive, **limits)
 
 
-async def loop(storage, archive, strategy, operator, evaluations, eval_fn=closeness):
-    while history_of(storage).counts()["evaluated"] < evaluations:
-        asked = await ek.ask(history_of(storage), archive, strategy, operator)
-        if asked.exhausted:
-            return
-        await ek.tell(history_of(storage), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(eval_fn), asked.individuals)))
+def unseeded(archive=None, evaluate=closeness, storage=None) -> ek.Experiment:
+    return ek.Experiment(storage or MemoryStorage(), ek.Task(None, evaluate), archive if archive is not None else BestArchive())
+
+
+async def climb(experiment, make, workers=1):
+    """Sample, create, submit until a limit: the shape of every recipe."""
+
+    async def worker():
+        while not experiment.limits.reached():
+            parents = experiment.archive.sample(1, best)
+            if not parents:
+                return
+            if child := await experiment.create(make(parents[0])):
+                await experiment.submit(child)
+
+    await asyncio.gather(*(worker() for _ in range(workers)))
 
 
 # records
@@ -110,119 +114,83 @@ def test_names_and_descriptions_are_stored_and_old_records_get_them_from_info():
     assert ek.util.title_and_body("x" * 300)[0].endswith("...") and len(ek.util.title_and_body("x" * 300)[0]) == 100
 
 
-# the loop and the history
+# create, submit and the history
 
 
 def test_hill_climb_and_history_totals():
-    storage = MemoryStorage()
-
-    async def go():
-        archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        await loop(storage, archive, Greedy(), bump(), 5)
-        return archive
-
-    archive = asyncio.run(go())
-    assert archive.best().genome == 3.0
-    counts = history_of(storage).counts()
+    e = experiment(max_evaluations=5)
+    asyncio.run(climb(e, bump()))
+    assert e.best().genome == 3.0 and e.archive.best() == e.best()
+    counts = e.counts()
     assert counts["created"] == 4 and counts["evaluated"] == 5 and counts["added"] == 4
-    assert [i.genome for i in history_of(storage).admitted()] == [0.0, 1.0, 2.0, 3.0]
-    assert [r["kind"] for r in history_of(storage).records()][:3] == ["evaluated", "created", "evaluated"]
-    chain = history_of(storage).admitted()
+    assert [i.genome for i in e.admitted()] == [0.0, 1.0, 2.0, 3.0]
+    assert [r["kind"] for r in e.records()][:3] == ["evaluated", "created", "evaluated"]
+    chain = e.admitted()
     assert all(later.parents == (earlier.id,) for earlier, later in zip(chain, chain[1:]))
+    assert e.limits.reached() == "5 evaluations"
+
+
+def test_submit_scores_and_offers_to_the_archive():
+    e = experiment()
+    kept = asyncio.run(e.submit(ek.Individual.new(2.0, [e.best().id])))
+    rejected = asyncio.run(e.submit(ek.Individual.new(9.0, [kept.id])))
+    assert kept.info["admitted"] and kept.objective("score") == -1.0 and not rejected.info["admitted"]
+    assert e.best().id == kept.id and e.counts()["created"] == 2 and not e.pending()
 
 
 def test_every_cost_is_in_the_history():
-    storage = MemoryStorage()
-    model = FunctionModel(lambda prompt: ek.operators.Completion("x", {"cost_usd": 0.25}))
+    model = FunctionModel(lambda prompt: ek.operators.Completion("```\nxy\n```", {"cost_usd": 0.25}))
 
     def priced(individual):
         return ek.Evaluation({"score": len(individual.genome)}, usage={"cost_usd": 0.5})
 
+    e = experiment("a", priced)
+
     async def go():
-        archive = await seeded(storage, BestArchive(storage=storage), "a", eval_fn=priced)
-        asked = await ek.ask(history_of(storage), archive, Greedy(), TextRewriteOperator(model))
-        await ek.tell(history_of(storage), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(priced), asked.individuals)))
-        history_of(storage).note("judge", "a judge's verdict", {"cost_usd": 0.125})
+        child = await e.create(rewrite_text(model, e.best()))
+        await e.submit(child)
+        e.note("judge", "a judge's verdict", {"cost_usd": 0.125})
 
     asyncio.run(go())
-    assert history_of(storage).usage()["cost_usd"] == pytest.approx(0.5 + 0.25 + 0.5 + 0.125)
-    assert history_of(storage).last_note("judge") == "a judge's verdict" and history_of(storage).counts()["judge"] == 1
+    assert e.usage()["cost_usd"] == pytest.approx(0.5 + 0.25 + 0.5 + 0.125)
+    assert e.last_note("judge") == "a judge's verdict" and e.counts()["judge"] == 1
 
 
-def test_operator_failures_and_exhausted():
-    storage = MemoryStorage()
+async def fails(reason="no idea", usage=None):
+    raise ek.OperatorError(reason, usage)
 
-    class Fails(ek.Operator):
-        async def create(self, selection, archive):
-            raise ek.OperatorError("no idea", {"cost_usd": 0.5})
+
+def test_failed_variations_are_recorded_with_their_cost():
+    e = unseeded()
+    assert e.archive.sample(1) == []
 
     async def go():
-        archive = BestArchive(storage=storage)
-        empty = await ek.ask(history_of(storage), archive, Greedy(), Fails())
-        await seeded(storage, archive, 0.0)
-        failed = await ek.ask(history_of(storage), archive, Greedy(), Fails(), n=2)
-        return empty, failed
+        return [await e.create(fails(usage={"cost_usd": 0.5})) for _ in range(2)]
 
-    empty, failed = asyncio.run(go())
-    assert empty.exhausted and not empty.individuals
-    assert not failed.exhausted and not failed.individuals and [f.reason for f in failed.failures] == ["no idea"] * 2
-    assert failed.failures[0].selection.parents[0].genome == 0.0
-    assert history_of(storage).usage()["cost_usd"] == 1.0 and history_of(storage).counts()["failed"] == 2
+    assert asyncio.run(go()) == [None, None]
+    assert e.usage()["cost_usd"] == 1.0 and e.counts()["failed"] == 2 and e.last_note("failed") == "no idea"
 
 
 def test_max_failures_stops_a_loop_that_only_fails():
-    from evokit.interface.run import RunCommands
-
-    class Fails(ek.Operator):
-        async def create(self, selection, archive):
-            raise ek.OperatorError("Invalid API key")
-
-    storage = MemoryStorage()
-    archive = asyncio.run(seeded(storage, BestArchive(storage=storage), 0.0))
-    RunCommands(storage, archive, Greedy(), Fails(), closeness).run(max_failures=3)
-    assert history_of(storage).counts()["failed"] == 3
-    assert history_of(storage).last_note("stop") == "3 operator failures in a row; the last: Invalid API key"
+    e = experiment(max_failures=3)
+    asyncio.run(climb(e, lambda parent: fails("Invalid API key")))
+    assert e.counts()["failed"] == 3
+    assert e.limits.reached() == "3 failures in a row; the last: Invalid API key"
 
 
 def test_failures_in_a_row_reset_when_a_child_is_created():
     calls = []
 
-    class Flaky(ek.Operator):
-        async def create(self, selection, archive):
-            calls.append(1)
-            if len(calls) % 3:
-                raise ek.OperatorError("flaky")
-            return ek.Offspring((ek.Individual.new(selection.parents[0].genome + 1, [selection.parents[0].id]),))
+    async def flaky(parent):
+        calls.append(1)
+        if len(calls) % 3:
+            raise ek.OperatorError("flaky")
+        return ek.Individual.new(parent.genome + 1, [parent.id]), {}
 
-    storage = MemoryStorage()
-
-    async def go():
-        archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        while not ek.Limits(max_evaluations=3, max_failures=3).reached(history_of(storage)):
-            asked = await ek.ask(history_of(storage), archive, Greedy(), Flaky())
-            await ek.tell(history_of(storage), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(closeness), asked.individuals)))
-
-    asyncio.run(go())
-    assert history_of(storage).counts()["evaluated"] == 3 and history_of(storage).counts()["failed"] == 4
-    assert history_of(storage).failures_in_a_row() == 0
-
-
-def test_a_failing_check_stops_the_loop_before_it_starts():
-    from evokit.interface.run import RunCommands
-
-    class NoKey(ek.Operator):
-        async def check(self):
-            raise ek.UsageError("no API key")
-
-        async def create(self, selection, archive):
-            raise AssertionError("create ran")
-
-    storage = MemoryStorage()
-    archive = asyncio.run(seeded(storage, BestArchive(storage=storage), 0.0))
-    before = len(history_of(storage).records())
-    with pytest.raises(ek.UsageError, match="no API key"):
-        RunCommands(storage, archive, Greedy(), Choice({"a": NoKey()}), closeness).run()
-    assert len(history_of(storage).records()) == before
+    e = experiment(max_evaluations=3, max_failures=3)
+    asyncio.run(climb(e, flaky))
+    assert e.counts()["evaluated"] == 3 and e.counts()["failed"] == 4
+    assert e.failures_in_a_row() == 0
 
 
 @pytest.mark.parametrize("backend", ["memory", "directory"])
@@ -243,11 +211,11 @@ def test_one_driver_at_a_time(tmp_path, backend):
 
 
 def test_eval_fn_decorator_makes_sync_and_async_functions_async():
-    @ek.eval_fn
+    @ek.evaluator
     def sync(individual):
         return ek.Evaluation({"score": individual.genome})
 
-    @ek.eval_fn(timeout="1s")
+    @ek.evaluator(timeout="1s")
     async def coro(individual):
         return ek.Evaluation({"score": individual.genome + 1})
 
@@ -256,7 +224,7 @@ def test_eval_fn_decorator_makes_sync_and_async_functions_async():
         return await sync(individual), await coro(individual)
 
     assert [e.objectives["score"] for e in asyncio.run(go())] == [1, 2]
-    assert sync.__name__ == "sync" and sync.is_eval_fn
+    assert sync.__name__ == "sync" and sync.is_evaluator
 
 
 def test_eval_fn_turns_crashes_and_timeouts_into_empty_evaluations():
@@ -264,7 +232,7 @@ def test_eval_fn_turns_crashes_and_timeouts_into_empty_evaluations():
     def crash(individual):
         raise RuntimeError("boom")
 
-    @ek.eval_fn(timeout=0.05)
+    @ek.evaluator(timeout=0.05)
     async def slow(individual):
         await asyncio.sleep(5)
 
@@ -273,91 +241,65 @@ def test_eval_fn_turns_crashes_and_timeouts_into_empty_evaluations():
 
     async def go():
         individual = ek.Individual.new(0)
-        return [await ek.as_eval_fn(fn)(individual) for fn in (crash, slow, wrong)]
+        return [await ek.as_evaluate(fn)(individual) for fn in (crash, slow, wrong)]
 
     crashed, timed_out, wrong_type = asyncio.run(go())
     assert crashed.objectives == {} and "boom" in crashed.feedback
     assert timed_out.objectives == {} and "timed out" in timed_out.feedback
     assert "must return an Evaluation" in wrong_type.feedback
     assert not BestArchive().add(ek.Individual.new(0).with_evaluation(crashed))
-    with pytest.raises(ValueError):
-        asyncio.run(ek.tell(MemoryStorage(), BestArchive(), [ek.Individual.new(0)], []))
 
 
-def test_tell_stores_evaluation_logs_in_the_artifact_folder(tmp_path):
-    storage = DirectoryStorage(tmp_path / "run")
+def test_submit_stores_evaluation_logs_in_the_artifact_folder(tmp_path):
+    def logged(individual):
+        return ek.Evaluation({"score": 1.0}, logs={"log.txt": b"evaluated 7"})
+
+    e = unseeded(evaluate=logged, storage=DirectoryStorage(tmp_path / "run"))
     individual = ek.Individual.new(7)
-    evaluation = ek.Evaluation({"score": 1.0}, logs={"log.txt": b"evaluated 7"})
-    (admitted,) = asyncio.run(ek.tell(history_of(storage), BestArchive(storage=storage), [individual], [evaluation]))
-    assert storage.read(f"artifacts/{individual.id}/log.txt") == b"evaluated 7"
-    assert admitted.evaluation.logs == {}
-
-
-def test_known_seed_skips_evaluate():
-    storage = MemoryStorage()
-    archive = BestArchive(storage=storage)
-    seed = ek.Individual.new(1.0).with_evaluation(ek.Evaluation({"score": 0.52}))
-    assert asyncio.run(ek.tell(history_of(storage), archive, [seed], [seed.evaluation])) == [seed] and archive.best() == seed
+    admitted = asyncio.run(e.submit(individual))
+    assert e.storage.read(f"artifacts/{individual.id}/log.txt") == b"evaluated 7"
+    assert admitted.evaluation.logs == {} and admitted.info["admitted"]
+    e.close()
 
 
 def test_pending_children_survive_a_crash(tmp_path):
-    path = tmp_path / "run"
-    storage = DirectoryStorage(path)
-    made = []
+    e = experiment(dir=tmp_path / "run")
+    child = asyncio.run(e.create(_priced(bump()(e.best()))))
+    assert [i.id for i in e.pending()] == [child.id]
+    e.close()
 
-    class Counting(ek.Operator):
-        async def create(self, selection, archive):
-            child = ek.Individual.new(selection.parents[0].genome + 1, [selection.parents[0].id])
-            made.append(child.id)
-            return ek.Offspring((child,), {"cost_usd": 1.0})
+    reopened = experiment(dir=tmp_path / "run")  # a new process: its own Experiment, which submits it
+    assert not reopened.pending() and child.id in {i.id for i in reopened.evaluated()}
+    assert reopened.usage()["cost_usd"] == 1.0
+    reopened.close()
 
-    async def crash_before_evaluating():
-        archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        return await ek.ask(history_of(storage), archive, Greedy(), Counting())
 
-    (child,) = asyncio.run(crash_before_evaluating()).individuals
-    assert [i.id for i in history_of(storage).pending()] == [child.id]
-
-    reopened = DirectoryStorage(path)  # a new process: its own history cache
-
-    async def resume():
-        archive = BestArchive(storage=reopened)
-        asked = await ek.ask(history_of(reopened), archive, Greedy(), Counting())
-        await ek.tell(history_of(reopened), archive, asked.individuals, await asyncio.gather(*map(ek.as_eval_fn(closeness), asked.individuals)))
-        return asked
-
-    asked = asyncio.run(resume())
-    assert [i.id for i in asked.individuals] == [child.id] and made == [child.id]
-    assert history_of(reopened).usage()["cost_usd"] == 1.0 and not history_of(reopened).pending()
+async def _priced(make):
+    child, _ = await make
+    return child, {"cost_usd": 1.0}
 
 
 def test_concurrent_workers_overlap():
-    storage = MemoryStorage()
-
     async def slow(individual):
         await asyncio.sleep(0.05)
         return ek.Evaluation({"score": individual.genome})
 
+    e = experiment(evaluate=slow, archive=UnboundedArchive(), max_evaluations=9)
+
     async def go():
-        archive = await seeded(storage, UnboundedArchive(storage=storage), 0.0, eval_fn=slow)
         started = time.monotonic()
-        await asyncio.gather(*(loop(storage, archive, Greedy(), bump(), 9, eval_fn=slow) for _ in range(4)))
+        await climb(e, bump(), workers=4)
         return time.monotonic() - started
 
     assert asyncio.run(go()) < 0.05 * 8 * 0.75
-    assert history_of(storage).counts()["evaluated"] >= 9
+    assert e.evaluations() >= 9
 
 
 def test_discarded_children_are_not_pending():
-    storage = MemoryStorage()
-
-    async def go():
-        archive = await seeded(storage, BestArchive(storage=storage), 0.0)
-        (child,) = (await ek.ask(history_of(storage), archive, Greedy(), bump())).individuals
-        history_of(storage).discard(child, "not novel")
-
-    asyncio.run(go())
-    assert not history_of(storage).pending() and history_of(storage).counts()["discarded"] == 1
+    e = experiment()
+    child = asyncio.run(e.create(bump()(e.best())))
+    e.discard(child, "not novel")
+    assert not e.pending() and e.counts()["discarded"] == 1
 
 
 # archives
@@ -366,7 +308,8 @@ def test_discarded_children_are_not_pending():
 def test_archive_replays_its_log_exactly(tmp_path):
     path = tmp_path / "run"
     storage = DirectoryStorage(path)
-    archive = IslandArchive(islands=3, features=("lines",), storage=storage)
+    archive = IslandArchive(islands=3, features=("lines",))
+    archive.attach(storage)
     seed = scored("program 1", 1.0, lines=30)
     assert archive.add(seed)
     copies = {i: archive.island_members(i)[0] for i in range(3)}
@@ -378,13 +321,16 @@ def test_archive_replays_its_log_exactly(tmp_path):
     assert archive.island_members(0)[0].info["operator"] == "migration"
     assert set(archive.niches()) == {(0, (2,)), (1, (2,)), (2, (2,))}
 
-    reopened = IslandArchive(islands=3, features=("lines",), storage=DirectoryStorage(path))
+    reopened = IslandArchive(islands=3, features=("lines",))
+    reopened.attach(DirectoryStorage(path))
     assert reopened.members() == archive.members() and reopened.metadata == archive.metadata
 
-    novelty = NoveltyArchive(["x"], k=1, threshold=1.0, storage=storage, name="novelty")
+    novelty = NoveltyArchive(["x"], k=1, threshold=1.0, name="novelty")
+    novelty.attach(storage)
     for x in (0.0, 0.5, 3.0):
         novelty.add(scored(None, 0.0, x=x))
-    again = NoveltyArchive(["x"], k=1, threshold=1.0, storage=storage, name="novelty")
+    again = NoveltyArchive(["x"], k=1, threshold=1.0, name="novelty")
+    again.attach(storage)
     assert [m["behaviour"] for m in again.metadata.values()] == [[0.0], [3.0]]
     assert again.state == novelty.state and again.state["threshold"] == pytest.approx(1.0 * 1.05 * 0.95 * 1.05)
     assert storage.exists("archive/changes.jsonl") and storage.exists("novelty/changes.jsonl")
@@ -418,91 +364,83 @@ def test_population_and_latest_archives():
     assert latest.add(newest) and latest.members() == [newest]
 
 
-# strategies and operators
+# sampling
 
 
-def test_proportional_selection_prefers_good_unexplored_individuals():
-    archive = UnboundedArchive()
+def test_archives_sample_with_their_default_or_any_strategy():
+    unbounded, best_only = UnboundedArchive(seed=0), BestArchive()
+    assert unbounded.sample(1) == [] and unbounded.top(1) == []
+    members = [scored(k, float(k)) for k in range(10)]
+    for m in members:
+        unbounded.add(m)
+        best_only.add(m)
+    assert [m.objective("score") for m in unbounded.top(3)] == [9.0, 8.0, 7.0]
+    assert len({m.id for m in unbounded.sample(5)}) == 5 and len(unbounded.sample(50)) == 10
+    assert best_only.sample(1) == [members[-1]] and unbounded.sample(2, best) == members[:-3:-1]
+    picks = unbounded.sample(3, tournament(10))
+    assert len(picks) == 3 and all(p.objective("score") >= 7.0 for p in picks)
+
+
+def test_proportional_prefers_good_unexplored_individuals():
+    archive = UnboundedArchive(seed=0)
     good, weak, solved = scored(0, 0.7), scored(1, 0.3), scored(2, 1.0)
     for a in (good, weak, solved, scored(3, 0.6, [good.id]), scored(4, 0.6, [good.id])):
         archive.add(a)
-    strategy = ProportionalSelection(seed=0)
-    picks = [s.parents[0].id for s in asyncio.run(strategy.select(archive, 2000))]
+    picks = [p.id for p in archive.sample(2000, proportional())]
     assert solved.id not in picks
-    members = archive.members()
-    w_good, w_weak = (strategy.weights(members)[members.index(a)] for a in (good, weak))
-    assert w_good == pytest.approx(1 / (1 + math.exp(-2)) / 3) and w_weak == pytest.approx(1 / (1 + math.exp(2)))
     assert picks.count(good.id) > picks.count(weak.id)
 
 
-def test_tournament_and_island_sampler():
-    archive = UnboundedArchive()
-    for score in range(10):
-        archive.add(scored(score, float(score)))
-    picks = asyncio.run(Tournament(size=10, parents=2, seed=0).select(archive, 3))
-    assert all(len(s.parents) == 2 and s.parents[0].objective("score") == 9.0 for s in picks)
-    assert asyncio.run(Greedy().select(UnboundedArchive(), 1)) == []
-
-    islands = IslandArchive(islands=2, features=(), cell_size=10)
-    islands.add(scored("seed", 1.0))
+def test_islands_take_turns_and_give_inspirations():
+    archive = IslandArchive(islands=2, features=(), cell_size=10, seed=0)
+    archive.add(scored("seed", 1.0))
     for k in range(4):
-        islands.add(scored(f"child {k}", 2.0 + k, [islands.island_members(k % 2)[0].id]))
-    selections = asyncio.run(IslandSampler(inspirations=2, seed=0).select(islands, 4))
-    for selection in selections:
-        (parent,) = selection.parents
-        assert selection.inspirations and parent not in selection.inspirations
+        archive.add(scored(f"child {k}", 2.0 + k, [archive.island_members(k % 2)[0].id]))
+    first, second = archive.sample(3, islands()), archive.sample(3, islands())
+    for parent, *others in (first, second):
+        assert others and parent not in others
+    assert {archive.island_of(first[0].id), archive.island_of(second[0].id)} == {0, 1}
 
 
-def test_choice_labels_children():
-    storage = MemoryStorage()
-    operator = Choice({"up": bump(1.0), "down": bump(-1.0)}, seed=0)
-
-    async def go():
-        archive = await seeded(storage, UnboundedArchive(storage=storage), 0.0)
-        await loop(storage, archive, Greedy(), operator, 20)
-
-    asyncio.run(go())
-    assert {i.info["operator"] for i in history_of(storage).evaluated() if i.parents} == {"up", "down"}
-
-
-def test_text_operator_shows_inspirations():
+def test_rewrite_text_uses_the_instructions_and_shows_others():
     prompts = []
     model = FunctionModel(lambda prompt: prompts.append(prompt) or "```\nbetter\n```")
     parent, other = scored("parent text", 1.0), scored("other text", 2.0)
-    offspring = asyncio.run(TextRewriteOperator(model).create(ek.Selection((parent,), (other,)), BestArchive()))
-    (child,) = offspring.children
+    child, _ = asyncio.run(rewrite_text(model, parent, [other], instructions="Be brief."))
     assert child.genome == "better" and child.parents == (parent.id,)
-    assert "parent text" in prompts[0] and "other text" in prompts[0]
+    assert "parent text" in prompts[0] and "other text" in prompts[0] and "Be brief." in prompts[0]
 
 
-def test_llm_operator_names_its_child_from_the_reply():
+def test_rewrite_text_names_its_child_from_the_reply():
     model = FunctionModel(lambda prompt: "Tighter wording\nShorter and clearer.\n```\nbetter\n```")
-    (child,) = asyncio.run(TextRewriteOperator(model).create(ek.Selection((scored("text", 1.0),)), BestArchive())).children
+    child, _ = asyncio.run(rewrite_text(model, scored("text", 1.0)))
     assert child.name == "Tighter wording" and child.description == "Shorter and clearer."
+    with pytest.raises(ek.OperatorError, match="did not change"):
+        asyncio.run(rewrite_text(FunctionModel(lambda prompt: "```\ntext\n```"), scored("text", 1.0)))
 
 
-# reading a run
+# reading an experiment
 
 
-def test_reading_a_run_like_git(tmp_path, capsys):
+def test_reading_an_experiment_like_git(tmp_path, capsys):
     from evokit.interface.cli import main
-    from evokit.interface.history import HistoryCommands
-
-    storage = DirectoryStorage(tmp_path / "run")
 
     def evaluate(individual):
         return ek.Evaluation({"score": -abs(individual.genome["x"] - 3)})
 
+    e = experiment({"x": 0}, evaluate, dir=tmp_path / "run")
+
     async def go():
-        archive = await seeded(storage, BestArchive(storage=storage), {"x": 0}, eval_fn=evaluate)
-        best = archive.best()
+        best = e.best()
         better = ek.Individual.new({"x": 2}, [best.id], name="x to 2", description="closer")
         worse = ek.Individual.new({"x": 9}, [best.id], name="x to 9")
-        await ek.tell(history_of(storage), archive, [better, worse], await asyncio.gather(*map(ek.as_eval_fn(evaluate), [better, worse])))
+        await e.submit(better)
+        await e.submit(worse)
         return best, better, worse
 
     seed, better, worse = asyncio.run(go())
-    runs = HistoryCommands(DirectoryStorage(tmp_path / "run"))
+    e.close()
+    runs = ek.open_experiment(tmp_path / "run")
     assert [e["id"] for e in runs.log()] == [better.id, seed.id] and runs.log()[0]["name"] == "x to 2"
     assert [e["id"] for e in runs.log(all=True)] == [worse.id, better.id, seed.id]
     assert [(e["admitted"], e["member"]) for e in runs.log(all=True)] == [(False, False), (True, True), (True, False)]
@@ -512,10 +450,51 @@ def test_reading_a_run_like_git(tmp_path, capsys):
     with pytest.raises(ek.UsageError, match="no parent"):
         runs.diff(seed)
 
-    # a run a Python loop wrote has no run/task.json; the read commands open it anyway
-    assert not (tmp_path / "run" / "run" / "task.json").exists()
+    # an experiment on a task made in Python has no task folder; the read commands open it anyway
+    assert runs.task is None and isinstance(runs.archive, BestArchive)
     capsys.readouterr()
     assert main(["log", "--all", "--dir", str(tmp_path / "run"), "--format", "json"]) == 0
-    assert [e["id"] for e in json.loads(capsys.readouterr().out)] == [worse.id, better.id, seed.id]
+    assert [entry["id"] for entry in json.loads(capsys.readouterr().out)] == [worse.id, better.id, seed.id]
     assert main(["log", "--dir", str(tmp_path / "missing")]) == 2
-    assert "no run" in json.loads(capsys.readouterr().err)["error"]
+    assert "no experiment" in json.loads(capsys.readouterr().err)["error"]
+
+
+def test_the_experiment_knows_when_the_best_improved():
+    history = unseeded(BestArchive(ties="accept"), lambda individual: ek.Evaluation({"score": individual.genome}))
+
+    async def go():
+        seed = ek.Individual.new(1.0)
+        await history.submit(seed)
+        tie = await history.submit(ek.Individual.new(1.0, [seed.id]))
+        history.note("draft", objectives={"score": 0.5}, improved=False)
+        better = await history.submit(ek.Individual.new(2.0, [tie.id]))
+        await history.submit(ek.Individual.new(0.0, [better.id]))
+        history.note("review")
+        history.note("draft", objectives={"score": 1.5}, improved=False)
+        return seed, tie, better
+
+    seed, tie, better = asyncio.run(go())
+    assert tie.info["admitted"]                       # a tie is kept, but is no improvement
+    assert history.best().id == better.id and [i.id for _, i in history.best_over_time()] == [seed.id, better.id]
+    assert history.notes("draft")[0]["objectives"] == {"score": 1.5}
+    assert history.best_over_time()[1][0] == 3
+    assert history.evaluations() == 4 and len(history.drafts()) == 2
+    assert history.since_improvement() == 2 and history.since_improvement(drafts=False) == 1
+    assert history.since_note("review") == 1 and history.since_note("never") == 6
+    assert history.elapsed() >= 0
+
+    plateau = ek.Limits(stop=[lambda e: "plateau" if e.since_improvement() >= 2 else None], experiment=history)
+    assert plateau.reached() == "plateau" and history.limits.reached() is None
+
+
+def test_one_process_writes_an_experiment(tmp_path):
+    storage = DirectoryStorage(tmp_path / "run")
+    history = ek.Experiment(storage)
+    history.note("hello")
+    ek.Experiment(DirectoryStorage(tmp_path / "run")).note("same process")   # shares the lock
+    with pytest.raises(ek.RunBusy):
+        with DirectoryStorage(tmp_path / "run").lock("driver"):
+            pass
+    history.close()
+    with DirectoryStorage(tmp_path / "run").lock("driver"):
+        pass

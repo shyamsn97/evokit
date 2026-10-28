@@ -2,12 +2,11 @@
 
 One lineage: keep a change only if the score went up, or held with less code; never stop.
 
-The agent you are talking to is the operator (the original setup): the CLI builds the run from
-the task folder's config.yaml, which has no operator.
+The agent you are talking to is the operator (the original setup):
 
     cd examples/circle_packing
     evokit status --task . --dir runs/autoresearch-external-0
-    evokit skill export claude --dir runs/autoresearch-external-0
+    evokit skill export claude
     # then in Claude Code, in this directory:
     #   "You are the evokit operator for runs/autoresearch-external-0. Follow the evokit skill. Never stop."
 
@@ -19,14 +18,11 @@ Unattended, a headless coding agent makes each change:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
-from algorithms.common import arguments, claude_code, coding_agent, packing_task, report, seed_archive
+from algorithms.common import arguments, coding_agent, packing_task, report
 
-import evokit as ek
 from evokit import recipes
-from evokit.archives import SimplerBestArchive
-from evokit.files import with_lines
-from evokit.storages import DirectoryStorage
 
 SIMPLICITY = (
     "Keep it simple: a change that scores the same with fewer lines of code is also kept, "
@@ -34,27 +30,12 @@ SIMPLICITY = (
 )
 
 
-async def run(directory: str, agent=None, max_evaluations: int | None = None, max_cost: float | None = None):
-    """A fresh headless coding-agent session per change."""
-    storage = DirectoryStorage(directory)
-    history = ek.History(storage)
-    task = packing_task(storage)
-    eval_fn = with_lines(task.eval_fn)
-    archive = SimplerBestArchive("score", size="lines", storage=storage)
-    await seed_archive(history, archive, task.project.seed_genome(), eval_fn)
-    await recipes.autoresearch(
-        task.project, eval_fn, agent or claude_code(), history=history, archive=archive,
-        instructions=f"{task.instructions}\n\n{SIMPLICITY}", objective="score",
-        results=storage.root / "results.tsv", max_evaluations=max_evaluations, max_cost=max_cost,
-    )
-    return storage, archive
-
-
 def main() -> None:
     args = arguments("autoresearch on circle packing")
-    agent = coding_agent(args.agent)
-    storage, archive = asyncio.run(run(args.dir, agent, max_evaluations=args.max_evaluations, max_cost=args.max_cost))
-    report(storage, archive)
+    task = packing_task()
+    task = replace(task, instructions=f"{task.instructions}\n\n{SIMPLICITY}")
+    asyncio.run(recipes.autoresearch(task, coding_agent(args.agent), dir=args.dir, max_evaluations=args.max_evaluations, max_cost=args.max_cost))
+    report(args.dir)
 
 
 if __name__ == "__main__":

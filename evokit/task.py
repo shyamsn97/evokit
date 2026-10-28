@@ -1,209 +1,143 @@
-"""Task: a folder that defines a problem, loaded into the objects a run is made of.
+"""Task: what evolves and how it is scored.
+
+    task = evokit.Task(seed=1.0, evaluate=lambda individual: Evaluation({"score": -abs(individual.genome - 3)}))
+    task = evokit.Task.from_directory("examples/circle_packing")
+    experiment = task.create_experiment("experiments/one", max_cost=5)
+
+A genome is any JSON value, or Files. A task folder holds Files:
 
     packing/
-      TASK.md        what the operator is told: the goal, the rules, what "better" means
-      config.yaml    which files evolve, how they are scored, which components to use
+      TASK.md        what the agent is told: the goal, the rules, what "better" means
+      config.yaml    which files evolve and how they are scored (`task:`), and optionally which
+                     recipe `evokit run` uses (`recipe:`)
       evaluate.py    the evaluator: part of the fixed environment, never evolved
       main.py        the seed: the genome files as they are now
 
-`load_task(dir)` reads the folder into a Task: a Project (genome files plus the read-only
-environment), an eval function (ScriptEvaluator over the `evaluate` command), the instructions
-(TASK.md), and the `run` section naming the archive, strategy and operator. `task.open(storage)`
-builds those components on the storage, as a Run; a new storage is seeded with the task's genome
-files, an existing one continues where it stopped. `evokit init NAME` writes a working template.
+`evokit init NAME` writes a working template.
 """
 
 from __future__ import annotations
 
-import contextlib
-import importlib
-import importlib.util
-import inspect
 import json
-import os
 import shutil
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import yaml
 
-from evokit.archive import Archive
-from evokit.archives import (
-    BestArchive,
-    IslandArchive,
-    LatestArchive,
-    PopulationArchive,
-    SimplerBestArchive,
-    UnboundedArchive,
-)
 from evokit.errors import UsageError
-from evokit.agents import ClaudeCode, CodingAgentOperator, CommandAgent
-from evokit.files import (
-    DEFAULT_IGNORE,
-    DEFAULT_PROTECTED,
-    DiffOperator,
-    FileRewriteOperator,
-    Project,
-    ScriptEvaluator,
-)
-from evokit.history import LOG, History
-from evokit.loop import EvalFn, as_eval_fn, tell
-from evokit.operator import Operator
-from evokit.operators import AnthropicModel
-from evokit.records import Individual
-from evokit.storage import Storage
-from evokit.storages import DirectoryStorage
-from evokit.strategies import Greedy, IslandSampler, ProportionalSelection, Tournament
-from evokit.strategy import Strategy
-from evokit.util import background, truncate
+from evokit.files import DEFAULT_IGNORE, DEFAULT_PROTECTED, Files, Project, ScriptEvaluator
+from evokit.evaluate import Evaluate
+
+if TYPE_CHECKING:
+    from evokit.archive import Archive
+    from evokit.experiment import Experiment, StopRule
 
 CONFIG, INSTRUCTIONS = "config.yaml", "TASK.md"
-RUN_TASK = "run/task.json"
+GENOME_JSON = "genome.json"
 TEMPLATE = Path(__file__).parent / "templates" / "task"
-IGNORE = (*DEFAULT_IGNORE, ".evokit/**", "runs/**")
+IGNORE = (*DEFAULT_IGNORE, ".evokit/**", "runs/**", "experiments/**")
 PROTECTED = (*DEFAULT_PROTECTED, CONFIG, INSTRUCTIONS)
-
-ARCHIVES: dict[str, Callable[..., Archive]] = {
-    "best": BestArchive,
-    "simpler": SimplerBestArchive,
-    "population": lambda size=10, **kw: PopulationArchive(size, **kw),
-    "islands": IslandArchive,
-    "unbounded": UnboundedArchive,
-    "latest": LatestArchive,
-}
-STRATEGIES: dict[str, Callable[..., Strategy]] = {
-    "greedy": lambda objective, **kw: Greedy(**kw),
-    "tournament": lambda objective, **kw: Tournament(**kw),
-    "proportional": lambda objective, **kw: ProportionalSelection(objective=objective, **kw),
-    "islands": lambda objective, **kw: IslandSampler(**kw),
-}
-OPERATORS = ("none", "diff", "rewrite", "coding-agent")
-
-
-@dataclass(frozen=True)
-class Run:
-    """A run opened from its storage: what the `evokit` commands work on. A run opened only to be
-    read (`open_history`) has just its storage and history; `tools` are extra commands from the
-    task's factory."""
-
-    storage: Storage
-    history: History
-    archive: Archive | None = None
-    strategy: Strategy | None = None
-    operator: Operator | None = None
-    eval_fn: EvalFn | None = None
-    task: "Task | None" = None
-    tools: tuple[Callable, ...] = ()
 
 
 @dataclass(frozen=True)
 class Task:
-    directory: Path
-    project: Project
-    eval_fn: EvalFn
-    instructions: str
+    """`seed`: the first genome (any JSON value, or Files). `evaluate(individual) -> Evaluation`,
+    sync or async: the one place scores come from. `instructions`: what agents are told.
+    `objective` and `minimize`: what archives rank by. `files`: for a Files genome, which files
+    of a folder evolve and which are the fixed environment around them (`Task.from_directory`)."""
+
+    seed: Any
+    evaluate: Evaluate
+    instructions: str = ""
     objective: str = "score"
     minimize: bool = False
-    run: dict = field(default_factory=dict)
+    files: Project | None = None
+    directory: Path | None = None
+
+    @classmethod
+    def from_directory(cls, directory: str | Path, environment: str | Path | None = None, ignore: Sequence[str] = ()) -> "Task":
+        """Read a task folder. `environment` is where the fixed files are snapshotted (a temporary
+        folder by default), and `ignore` adds patterns that are neither genome nor environment."""
+        directory = Path(directory).resolve()
+        spec = read_config(directory).get("task") or {}
+        for key in ("genome", "evaluate"):
+            if key not in spec:
+                raise UsageError(f"{CONFIG} has no task.{key}", hint="e.g. genome: [main.py] and evaluate: python evaluate.py under task:")
+        instructions = directory / INSTRUCTIONS
+        if not instructions.is_file():
+            raise UsageError(f"no {INSTRUCTIONS} in {directory}", hint="describe the goal, the rules and the scoring there")
+        files = Project(
+            directory,
+            genome=spec["genome"],
+            protected=PROTECTED,
+            ignore=(*IGNORE, *spec.get("ignore", ()), *ignore),
+            environment=environment,
+        )
+        return cls(
+            seed=files.seed_genome(),
+            evaluate=ScriptEvaluator(files, spec["evaluate"], timeout=spec.get("timeout")),
+            instructions=instructions.read_text().strip(),
+            objective=spec.get("objective", "score"),
+            minimize=bool(spec.get("minimize", False)),
+            files=files,
+            directory=directory,
+        )
 
     @property
     def name(self) -> str:
-        return self.directory.name
+        return self.directory.name if self.directory else "task"
 
-    def seed(self) -> Individual:
-        """The task's genome files as they are now, as a fresh individual."""
-        return Individual.new(self.project.seed_genome(), name="seed")
+    @property
+    def editable(self) -> list[str]:
+        """Which files in a checkout are the genome, described for agents."""
+        return self.files.editable if self.files else [GENOME_JSON]
 
-    def components(self, storage: Storage, history: History | None = None) -> tuple[Archive, Strategy, Operator | None]:
-        """The archive (on `storage`, so it restores itself), strategy and operator the `run` section
-        names; a coding agent operator reads the run through `history` (default: a new one)."""
-        archive, strategy, operator, _, _ = self._build(storage, history)
-        return archive, strategy, operator
+    def checkout(self, genome: Any, directory: str | Path) -> Path:
+        """`directory`, emptied, then holding `genome`: with `files`, the whole folder (environment
+        and genome files); otherwise the genome as genome.json. Where an agent works."""
+        directory = Path(directory)
+        if self.files is not None:
+            self.files.checkout(genome if isinstance(genome, Files) else Files(), directory)
+        else:
+            _empty(directory)
+            (directory / GENOME_JSON).write_text(json.dumps(genome, indent=2) + "\n")
+        return directory
 
-    def _build(self, storage: Storage, history: History | None = None) -> tuple[Archive, Strategy, Operator | None, EvalFn, tuple]:
-        if "factory" in self.run:
-            return self._from_factory(storage)
-        run = self.run
+    def read(self, directory: str | Path) -> Any:
+        """The genome in `directory`, as an agent left it. Raises EnvironmentModified if it edited
+        fixed files, UsageError if genome.json is not JSON."""
+        if self.files is not None:
+            return self.files.read(directory)
+        path = Path(directory) / GENOME_JSON
         try:
-            archive = ARCHIVES[run.get("archive", "best")](
-                objective=self.objective, minimize=self.minimize, storage=storage, **run.get("archive_options", {})
-            )
-            strategy = STRATEGIES[run.get("strategy", "greedy")](self.objective, **run.get("strategy_options", {}))
-        except KeyError as exc:
-            raise UsageError(f"{CONFIG}: unknown archive or strategy {exc}", hint=f"archives: {', '.join(ARCHIVES)}; strategies: {', '.join(STRATEGIES)}") from None
-        return archive, strategy, self._operator(history or History(storage)), self.eval_fn, ()
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise UsageError(f"{GENOME_JSON} is not valid JSON: {exc}", hint="leave the genome as one JSON value") from None
 
-    def _operator(self, history: History) -> Operator | None:
-        kind, options = self.run.get("operator", "none"), dict(self.run.get("operator_options", {}))
-        if kind == "none":
-            return None
-        if kind in ("diff", "rewrite"):
-            price = self.run.get("price")
-            model = AnthropicModel(self.run.get("model", "claude-sonnet-4-5"), price=tuple(price) if price else None)
-            cls = DiffOperator if kind == "diff" else FileRewriteOperator
-            return cls(model, self.project, instructions=self.instructions, **options)
-        if kind == "coding-agent":
-            agent = self.run.get("agent", "claude")
-            agent = ClaudeCode() if agent == "claude" else CommandAgent(agent)
-            if options.get("max_draft_evals"):
-                options["eval_fn"] = self.eval_fn
-            return CodingAgentOperator(agent, self.project, history=history, instructions=self.instructions, **options)
-        raise UsageError(f"{CONFIG}: unknown operator {kind!r}", hint=f"operators: {', '.join(OPERATORS)}")
+    def create_experiment(
+        self,
+        dir: str | Path | None = None,
+        *,
+        archive: "Archive | None" = None,
+        max_cost: float | None = None,
+        max_evaluations: int | None = None,
+        max_failures: int | None = 10,
+        stop: Sequence["StopRule"] = (),
+    ) -> "Experiment":
+        """A search on this task, kept in `dir` (in memory without one), or the one there, continued.
+        `archive` (default: BestArchive) is kept in the experiment; a new experiment scores the seed
+        into it first (UsageError, and nothing recorded, if the seed fails). The limits hold over
+        the whole experiment, restarts included."""
+        from evokit.experiment import Experiment
 
-    def _from_factory(self, storage: Storage):
-        """`factory: MODULE:NAME`: build(task, storage) returns the archive, strategy, optionally an
-        operator and an eval function (default: the task's), and optionally a list of functions,
-        which become extra commands."""
-        with _working_directory(self.directory):
-            build = load_factory(self.run["factory"], self.directory)
-            returned = build(self, storage)
-        objects = list(returned) if isinstance(returned, (tuple, list)) else [returned]
-        archive = _one([o for o in objects if isinstance(o, Archive)], "archive")
-        strategy = _one([o for o in objects if isinstance(o, Strategy)], "strategy")
-        operator = _one([o for o in objects if isinstance(o, Operator)], "operator", required=False)
-        eval_fn = _one([o for o in objects if callable(o) and not isinstance(o, type)], "eval function", required=False)
-        if archive.storage is not storage:
-            raise UsageError("the factory's archive does not use the run's storage", hint="build it with storage=storage")
-        tools = tuple(tool for o in objects if isinstance(o, list) for tool in o)
-        return archive, strategy, operator, eval_fn or self.eval_fn, tools
-
-    def open(self, storage: Storage) -> Run:
-        """A run of this task on `storage`. A new storage is seeded first: the task's genome files
-        are evaluated and added to the archive (UsageError, and nothing recorded, if they fail). An
-        existing one continues: its archive restores itself and nothing is re-run."""
-        if storage.exists(RUN_TASK):
-            recorded = Path(json.loads(storage.read(RUN_TASK))["task"])
-            if recorded != self.directory:
-                raise UsageError(f"this run belongs to the task {recorded}, not {self.directory}", hint="use another --dir")
-        history = History(storage)
-        archive, strategy, operator, eval_fn, tools = self._build(storage, history)
-        run = Run(storage, history, archive, strategy, operator, eval_fn, self, tools)
-        if not len(archive):
-            seed(run, self.seed())
-        if not storage.exists(RUN_TASK):
-            storage.write(RUN_TASK, json.dumps({"task": str(self.directory)}).encode())
-        return run
+        return Experiment.new(self, dir, archive, max_cost, max_evaluations, max_failures, stop)
 
 
-def seed(run: Run, individual: Individual) -> Individual:
-    """Evaluate `individual` and add it to the archive. Raises UsageError, recording nothing, if it fails its evaluation."""
-    evaluation = background.run(as_eval_fn(run.eval_fn)(individual))
-    if not evaluation.objectives:
-        raise UsageError(
-            f"the seed failed its evaluation: {truncate(evaluation.feedback, 2000)}",
-            hint="fix the task's files or its evaluator, then run the command again",
-        )
-    background.run(tell(run.history, run.archive, [individual], [evaluation]))
-    return individual.with_evaluation(evaluation)
-
-
-def load_task(directory: str | Path, environment: str | Path | None = None, ignore: Sequence[str] = ()) -> Task:
-    """Read a task folder. `environment` is where the fixed files are snapshotted (a temporary folder
-    by default; a run keeps its own in `<run>/env`), and `ignore` adds patterns that are neither genome
-    nor environment."""
-    directory = Path(directory).resolve()
+def read_config(directory: str | Path) -> dict:
+    """A task folder's config.yaml."""
+    directory = Path(directory)
     if not (directory / CONFIG).is_file():
         raise UsageError(f"no {CONFIG} in {directory}", hint="create a task with `evokit init NAME`")
     try:
@@ -211,52 +145,8 @@ def load_task(directory: str | Path, environment: str | Path | None = None, igno
     except yaml.YAMLError as exc:
         raise UsageError(f"{directory / CONFIG}: {exc}") from None
     if not isinstance(config, dict):
-        raise UsageError(f"{CONFIG} must be a mapping with `task:` and `run:` sections")
-    spec = config.get("task") or {}
-    for key in ("genome", "evaluate"):
-        if key not in spec:
-            raise UsageError(f"{CONFIG} has no task.{key}", hint="e.g. genome: [main.py] and evaluate: python evaluate.py under task:")
-    instructions = directory / INSTRUCTIONS
-    if not instructions.is_file():
-        raise UsageError(f"no {INSTRUCTIONS} in {directory}", hint="describe the goal, the rules and the scoring there")
-    project = Project(
-        directory,
-        genome=spec["genome"],
-        protected=PROTECTED,
-        ignore=(*IGNORE, *spec.get("ignore", ()), *ignore),
-        environment=environment,
-    )
-    return Task(
-        directory=directory,
-        project=project,
-        eval_fn=ScriptEvaluator(project, spec["evaluate"], timeout=spec.get("timeout")),
-        instructions=instructions.read_text().strip(),
-        objective=spec.get("objective", "score"),
-        minimize=bool(spec.get("minimize", False)),
-        run=dict(config.get("run") or {}),
-    )
-
-
-def open_run(directory: str | Path, task: str | Path | None = None) -> Run:
-    """The run in `directory`. A new directory needs `task`, and is seeded from it."""
-    storage = DirectoryStorage(directory)
-    if task is None:
-        if not storage.exists(RUN_TASK):
-            raise UsageError(f"no run in {Path(directory)}", hint="start one with --task TASK_DIR (create a task with `evokit init NAME`)")
-        task = json.loads(storage.read(RUN_TASK))["task"]
-    task_dir = Path(task).resolve()
-    inside = _relative(storage.root, task_dir)
-    loaded = load_task(task_dir, environment=storage.root / "env", ignore=(f"{inside}/**",) if inside else ())
-    return loaded.open(storage)
-
-
-def open_history(directory: str | Path) -> Run:
-    """The run in `directory`, for reading only: no task needed, so it opens any run directory,
-    including ones a Python recipe wrote."""
-    if not (Path(directory) / LOG).is_file():
-        raise UsageError(f"no run in {Path(directory)}", hint="point --dir (or $EVOKIT_DIR) at a run directory")
-    storage = DirectoryStorage(directory)
-    return Run(storage, History(storage))
+        raise UsageError(f"{CONFIG} must be a mapping with a `task:` section")
+    return config
 
 
 def init_task(directory: str | Path) -> Path:
@@ -268,50 +158,13 @@ def init_task(directory: str | Path) -> Path:
     return directory.resolve()
 
 
-def load_factory(ref: str, cwd: Path) -> Callable:
-    if ":" not in ref:
-        raise UsageError(f"invalid factory {ref!r}", hint="use MODULE:NAME or FILE.py:NAME, e.g. evo:build")
-    module_ref, _, attr = ref.rpartition(":")
-    path = Path(module_ref) if module_ref.endswith(".py") else cwd / (module_ref.replace(".", "/") + ".py")
-    if not path.is_absolute():
-        path = cwd / path
-    if path.is_file():
-        name = f"_evokit_factory_{abs(hash(str(path.resolve())))}"
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    elif module_ref.endswith(".py"):
-        raise UsageError(f"factory file not found: {path}")
-    else:
-        module = importlib.import_module(module_ref)
-    target = getattr(module, attr, None)
-    if not callable(target) or len(inspect.signature(target).parameters) != 2:
-        raise UsageError(f"{ref} must be a function build(task, storage)")
-    return target
+def _empty(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for child in directory.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
-@contextlib.contextmanager
-def _working_directory(path: Path) -> Iterator[None]:
-    previous = os.getcwd()
-    os.chdir(path)
-    sys.path.insert(0, str(path))
-    try:
-        yield
-    finally:
-        os.chdir(previous)
-        with contextlib.suppress(ValueError):
-            sys.path.remove(str(path))
-
-
-def _one(objects: list, kind: str, required: bool = True) -> Any:
-    if len(objects) > 1 or (required and not objects):
-        raise UsageError(f"the factory must return {'exactly' if required else 'at most'} one {kind} (got {len(objects)})")
-    return objects[0] if objects else None
-
-
-def _relative(path: Path, root: Path) -> str | None:
-    try:
-        return path.resolve().relative_to(root).as_posix()
-    except ValueError:
-        return None
+__all__ = ["Task", "init_task", "read_config"]

@@ -8,7 +8,6 @@ can be killed.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
 import os
@@ -17,10 +16,10 @@ import shutil
 import sys
 import uuid
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Mapping
 
 from evokit.agents import repl_server
-from evokit.agents.base import AgentResult, CodingAgent, kill
+from evokit.agents.harness import Agent, Turn, kill
 from evokit.operators.models import Model
 from evokit.records import merge_usage
 from evokit.util import parse_duration, reaped, spawned, truncate
@@ -104,7 +103,7 @@ class ReplProcess:
         return json.loads(line)["output"]
 
 
-class ReplAgent(CodingAgent):
+class ReplAgent(Agent):
     """A coding agent on any `Model` (e.g. `OpenAIModel` for any OpenAI-compatible endpoint).
 
     Each reply's ```repl blocks run in order in a `ReplProcess` in the directory, and their output
@@ -116,8 +115,8 @@ class ReplAgent(CodingAgent):
     uses, so the agent can import what the program imports.
     """
 
-    on_cost: Callable[[float | None], None] | None = None
     tool_style = "python"
+    takes_system = True
 
     def __init__(
         self,
@@ -136,35 +135,22 @@ class ReplAgent(CodingAgent):
         self.python = python or shutil.which("python") or sys.executable
         self.sessions: dict[str, list[dict[str, str]]] = {}
 
-    def with_budget(self, usd: float | None) -> "ReplAgent":
-        """A copy that stops before a model call once it has spent `usd` (it can overshoot by one call)."""
-        if usd is None:
-            return self
-        agent = copy.copy(self)
-        agent.max_budget_usd = usd if self.max_budget_usd is None else min(usd, self.max_budget_usd)
-        return agent
-
-    def with_meter(self, on_cost: Callable[[float | None], None]) -> "ReplAgent":
-        """A copy that reports its cost after every model call."""
-        agent = copy.copy(self)
-        agent.on_cost = on_cost
-        return agent
-
     async def check(self) -> None:
         await self.model.check()
 
-    async def _run(self, directory, prompt, session=None, env=None) -> AgentResult:
+    async def _run(self, cwd, prompt, session, env, budget, system=None) -> Turn:
         earlier = self.sessions.get(session or "")
         if earlier:
             prompt = "[The Python process was restarted: earlier variables are gone.]\n\n" + prompt
-        messages = list(earlier or [{"role": "system", "content": self.system}])
+        messages = list(earlier or [{"role": "system", "content": "\n\n".join(filter(None, (self.system, system)))}])
         messages.append({"role": "user", "content": prompt})
         session = session if earlier else uuid.uuid4().hex[:12]
         usage: dict[str, float] = {}
-        repl = ReplProcess(Path(directory), env or {}, self.python)
+        repl = ReplProcess(Path(cwd), env, self.python)
         await repl.start()
         try:
-            error = await asyncio.wait_for(self._steps(messages, usage, repl), self.timeout)
+            budgets = [b for b in (self.max_budget_usd, budget) if b is not None]
+            error = await asyncio.wait_for(self._steps(messages, usage, repl, min(budgets) if budgets else None), self.timeout)
         except asyncio.TimeoutError:
             error = f"timed out after {self.timeout:.0f}s"
         except Exception as exc:
@@ -173,23 +159,21 @@ class ReplAgent(CodingAgent):
             await repl.close()
             self.sessions[session] = messages
         replies = [m["content"] for m in messages if m["role"] == "assistant"]
-        return AgentResult(
-            summary=replies[-1] if replies else "",
+        return Turn(
+            text=replies[-1] if replies else "",
             usage=usage,
             session=session,
             error=error and truncate(error, 2000),
             transcript="".join(json.dumps(m) + "\n" for m in messages),
         )
 
-    async def _steps(self, messages: list[dict[str, str]], usage: dict[str, float], repl: ReplProcess) -> str | None:
+    async def _steps(self, messages: list[dict[str, str]], usage: dict[str, float], repl: ReplProcess, budget: float | None) -> str | None:
         """Model calls and blocks until a reply has no block; an error message if it stops early."""
         for _ in range(self.max_steps):
-            if self.max_budget_usd is not None and usage.get("cost_usd", 0) >= self.max_budget_usd:
-                return f"spent its ${self.max_budget_usd:g} budget"
+            if budget is not None and usage.get("cost_usd", 0) >= budget:
+                return f"spent its ${budget:g} budget"
             reply = await self.model.chat(messages)
             usage.update(merge_usage(usage, reply.usage, {"turns": 1}))
-            if self.on_cost is not None:
-                self.on_cost(usage.get("cost_usd"))
             messages.append({"role": "assistant", "content": reply.text})
             blocks = REPL_BLOCK.findall(reply.text)
             if not blocks:

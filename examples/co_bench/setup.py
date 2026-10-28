@@ -142,11 +142,6 @@ def make_task(problem: str, data: Path) -> Path:
         "  timeout: 30m\n"
         "  objective: score\n"
         "  minimize: false\n"
-        "\n"
-        "run:\n"
-        "  archive: best\n"
-        "  strategy: greedy\n"
-        "  operator: none\n"
     )
     return task
 

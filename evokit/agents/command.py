@@ -1,4 +1,4 @@
-"""CommandAgent: any command-line coding agent."""
+"""CommandAgent: any command-line coding agent, one process per turn."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import shlex
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from evokit.agents.base import AgentResult, CodingAgent, kill
+from evokit.agents.harness import Agent, Turn, kill
 from evokit.util import parse_duration, reaped, spawned, truncate
 
 
-class CommandAgent(CodingAgent):
+class CommandAgent(Agent):
     """Any CLI agent. `{prompt}` in argv is substituted; otherwise the prompt goes to stdin.
 
     If the last stdout line is a JSON object, its `summary`, `cost_usd`, `tokens`, and
@@ -26,17 +26,17 @@ class CommandAgent(CodingAgent):
         self.timeout = parse_duration(timeout)
         self.env = dict(env or {})
 
-    async def _run(self, directory, prompt, session=None, env=None) -> AgentResult:
+    async def _run(self, cwd, prompt, session, env, budget) -> Turn:
         uses_arg = any("{prompt}" in a for a in self.argv)
         argv = [a.replace("{prompt}", prompt).replace("{session}", session or "") for a in self.argv]
         try:
             code, out, err = await _exec(
-                argv, Path(directory), {**self.env, **(env or {})}, None if uses_arg else prompt.encode(), self.timeout
+                argv, Path(cwd), {**self.env, **env}, None if uses_arg else prompt.encode(), self.timeout
             )
         except asyncio.TimeoutError:
-            return AgentResult("", error=f"agent timed out after {self.timeout:.0f}s")
+            return Turn("", error=f"agent timed out after {self.timeout:.0f}s", session=session)
         except FileNotFoundError:
-            return AgentResult("", error=f"{argv[0]!r} not found")
+            return Turn("", error=f"{argv[0]!r} not found")
         data = {}
         lines = out.strip().splitlines()
         if lines and lines[-1].startswith("{"):
@@ -45,8 +45,8 @@ class CommandAgent(CodingAgent):
             except json.JSONDecodeError:
                 data = {}
         usage = {k: float(data[k]) for k in ("cost_usd", "tokens") if isinstance(data.get(k), (int, float))}
-        return AgentResult(
-            summary=str(data.get("summary") or truncate(out.strip(), 4000)),
+        return Turn(
+            text=str(data.get("summary") or truncate(out.strip(), 4000)),
             usage=usage,
             session=data.get("session") or session,
             trace=truncate(err, 4000) if err else None,

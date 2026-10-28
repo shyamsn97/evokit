@@ -3,68 +3,76 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-import evokit
+from evokit.agents import Agent
 from evokit.archive import Archive
-from evokit.agents import CodingAgent, CodingAgentOperator
-from evokit.files import Project
-from evokit.loop import EvalFn, Limits
+from evokit.archives import SimplerBestArchive
+from evokit.errors import EnvironmentModified
+from evokit.files import with_lines
 from evokit.records import Individual
-from evokit.history import History
-from evokit.strategies import Greedy
+from evokit.task import Task
+from evokit.util import truncate
+
+RESULTS = "results.tsv"
+
+CHANGE = """Make one change to the program that you expect to improve its score. Score it before you
+finish; if your change made it worse, put back the best version you measured."""
+
+
+@dataclass
+class Change:
+    """What this version is."""
+
+    title: str
+    description: str = ""
 
 
 async def autoresearch(
-    project: Project,
-    eval_fn: EvalFn,
-    agent: CodingAgent,
+    task: Task,
+    agent: Agent,
     *,
-    history: History,
-    archive: Archive,
-    instructions: str | None = None,
-    objective: str = "val_bpb",
-    results: str | Path | None = "results.tsv",
-    max_evaluations: int | None = None,
+    dir: str | Path | None = None,
+    archive: Archive | None = None,
     max_cost: float | None = None,
-    max_failures: int | None = 10,
+    max_evaluations: int | None = None,
 ) -> Individual | None:
-    """Edit, evaluate, keep or revert, and log every attempt to `results` (a TSV); never stop,
-    unless `max_evaluations` (counted in this call) is given, the run has spent `max_cost` US dollars
-    (checked between changes, so the last session can go over), or the agent fails `max_failures`
-    times in a row.
+    """Edit, evaluate, keep or revert, and log every attempt to results.tsv in the experiment;
+    never stop, unless a limit is reached (checked between changes, so the last one can go over).
 
-    The caller passes a seeded archive, usually SimplerBestArchive, and an eval_fn wrapped in
-    files.with_lines so the archive's size objective exists. A fresh agent session makes each change.
+    A fresh agent session makes each change, starting from the best. `archive` defaults to
+    SimplerBestArchive, which breaks ties by the code's size: for a Files genome, a "lines"
+    objective is added to every evaluation.
     """
-    strategy = Greedy()
-    operator = CodingAgentOperator(agent, project, history=history, instructions=instructions)
-    limits = Limits(max_cost=max_cost, max_failures=max_failures)
-    score = evokit.as_eval_fn(eval_fn)
-    done = 0
-
-    def stop_reason() -> str | None:
-        if max_evaluations is not None and done >= max_evaluations:
-            return f"{max_evaluations} evaluations"
-        return limits.reached(history)
-
-    await operator.check()
-    with history.storage.lock("driver"):
-        while not stop_reason():
-            asked = await evokit.ask(history, archive, strategy, operator)
-            if asked.exhausted:
-                break
-            evaluations = await asyncio.gather(*map(score, asked.individuals))
-            admitted = {i.id for i in await evokit.tell(history, archive, asked.individuals, evaluations)}
-            done += len(evaluations)
-            if results is not None:
-                with open(results, "a") as tsv:
-                    for child, evaluation in zip(asked.individuals, evaluations):
-                        child = child.with_evaluation(evaluation)
-                        status = "keep" if child.id in admitted else "discard" if evaluation.objectives else "crash"
-                        tsv.write(row(child, status, objective))
-    history.note("stop", stop_reason() or "nothing left to select")
-    return archive.best()
+    if task.files is not None:
+        task = replace(task, evaluate=with_lines(task.evaluate))
+    archive = archive if archive is not None else SimplerBestArchive(size="lines")
+    experiment = task.create_experiment(dir, archive=archive, max_cost=max_cost, max_evaluations=max_evaluations)
+    await agent.check()
+    while not experiment.limits.reached():
+        parent = archive.top(1)[0]
+        started = time.monotonic()
+        async with experiment.start(agent, start=parent, submit=False) as directory:
+            turn = await agent.prompt(CHANGE, output=Change)
+            try:
+                genome = await asyncio.to_thread(task.read, directory)
+            except EnvironmentModified as exc:
+                genome, turn = None, replace(turn, error=f"{exc.message}. {exc.hint}")
+        if genome is None or genome == parent.genome:
+            experiment.note("failed", turn.error or f"the agent made no changes: {truncate(turn.text, 2000)}")
+            continue
+        info = {"operator": "agent", "session": turn.session}
+        if turn.output is None:
+            info["agent_error"] = truncate(turn.error or "", 4000)
+        title, description = (turn.output.title, turn.output.description) if turn.output else ("", "")
+        child = Individual.new(genome, [parent.id], info, name=title, description=truncate(description, 4000))
+        child = await experiment.submit(child, {"seconds": time.monotonic() - started})
+        status = "keep" if child.info["admitted"] else "discard" if child.evaluation.objectives else "crash"
+        experiment.storage.append(RESULTS, row(child, status, task.objective).encode())
+    experiment.note("stop", experiment.limits.reached())
+    return experiment.best()
 
 
 def row(individual: Individual, status: str, objective: str) -> str:

@@ -39,8 +39,8 @@ class RunBusy(UsageError):
 
 
 class OperatorError(Exception):
-    """The operator tried and produced nothing, e.g. the LLM's diff didn't apply. `ask` records it with
-    its cost, and stores `logs` (file name -> contents) under failed/<id>/."""
+    """A variation tried and produced nothing, e.g. the LLM's diff didn't apply. `experiment.create`
+    records it with its cost, and stores `logs` (file name -> contents) under failed/<id>/."""
 
     def __init__(self, reason: str, usage: dict | None = None, logs: dict[str, bytes] | None = None):
         super().__init__(reason)

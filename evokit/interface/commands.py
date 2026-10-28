@@ -1,175 +1,100 @@
-"""One `@command` registry, rendered into CLI, MCP, SKILL.md, and Python tools."""
+"""The `evokit` commands: plain functions over an opened Experiment, served as the CLI, the MCP
+server and the skill's command reference.
+
+Each takes the Experiment first; `experiment_tools(experiment)` binds them and names them as
+commands. The read commands (stats, log, show, diff, grep, notes) are the same functions agents
+get as tools, and work on any experiment directory; the others need its task. `evokit run`
+(in cli.py) runs a recipe.
+"""
 
 from __future__ import annotations
 
-import dataclasses
-import datetime as _dt
 import functools
-import inspect
-import typing
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Callable
 
-from evokit.records import Evaluation, Individual
+from evokit.agents.tools import tool_name
+from evokit.errors import UsageError
+from evokit.experiment import READ_TOOLS, Experiment
+from evokit.records import Individual
+from evokit.util import background
 
-SURFACES = frozenset({"cli", "mcp", "tools"})
+
+def _archive(experiment: Experiment):
+    if experiment.archive is None:
+        raise UsageError("this experiment's archive cannot be reopened", hint="continue it from Python, with the archive it was made with")
+    return experiment.archive
 
 
-def command(
-    fn: Callable | None = None,
-    *,
-    name: str | None = None,
-    surfaces: Iterable[str] = SURFACES,
-    result: Callable[[Any, Any], Any] | None = None,
-    positional: Iterable[str] = (),
-):
-    """Mark a method as an agent-facing command.
+def status(experiment: Experiment) -> dict:
+    """The archive's size and best individual, and what the experiment has created, evaluated and spent."""
+    archive = _archive(experiment)
+    return {
+        "task": str(experiment.task.directory) if experiment.task and experiment.task.directory else None,
+        "archive": type(archive).__name__,
+        "members": len(archive),
+        "best": experiment.best(),
+        "counts": dict(experiment.counts()),
+        "usage": dict(experiment.usage()),
+        "pending": [i.id for i in experiment.pending()],
+    }
 
-    `result(owner, value)` optionally reshapes the return value for JSON surfaces
-    (CLI and MCP); Python tools always get the raw value. On the command line, required
-    parameters and individuals are positional, and so are the optional ones named in `positional`.
+
+def list_individuals(experiment: Experiment) -> list[Individual]:
+    """The archive's members (best first, for ranked archives)."""
+    return _archive(experiment).members()
+
+
+def checkout_individual(experiment: Experiment, id: str, directory: str) -> dict:
+    """Write this individual (with the task's fixed files around it) into a new directory to edit.
+
+    Edit the genome files there, then evaluate-directory.
     """
-
-    def mark(f: Callable) -> Callable:
-        f.__evokit_command__ = {
-            "name": (name or f.__name__).replace("_", "-"),
-            "surfaces": frozenset(surfaces),
-            "result": result,
-            "positional": frozenset(positional),
-        }
-        return f
-
-    return mark(fn) if fn is not None else mark
-
-
-@dataclass(frozen=True)
-class Command:
-    name: str
-    func: Callable  # bound method
-    surfaces: frozenset
-    result: Callable | None
-    owner: Any
-    attr: str
-
-    @property
-    def doc(self) -> str:
-        return inspect.getdoc(self.func) or ""
-
-    @property
-    def summary(self) -> str:
-        return self.doc.splitlines()[0] if self.doc else ""
-
-    @property
-    def signature(self) -> inspect.Signature:
-        return inspect.signature(self.func)
-
-    def shape(self, value: Any) -> Any:
-        return encode(self.result(self.owner, value) if self.result else value)
+    individual, task = experiment.lookup(id), experiment._task()
+    path = Path(directory)
+    if path.exists() and any(path.iterdir()):
+        raise UsageError(f"directory is not empty: {path}", hint="check out into a new directory")
+    task.checkout(individual.genome, path)
+    return {
+        "directory": str(path.resolve()),
+        "individual": individual.id,
+        "genome": task.editable,
+        "hint": f"Edit only files matching {task.editable}, then `evokit evaluate-directory {path} --parent {individual.id}`.",
+    }
 
 
-def commands_of(obj: Any, surface: str | None = None) -> list[Command]:
-    found = []
-    for attr in dir(type(obj)):
-        raw = getattr(type(obj), attr, None)
-        meta = getattr(raw, "__evokit_command__", None)
-        if meta is None or (surface and surface not in meta["surfaces"]):
-            continue
-        found.append(Command(meta["name"], getattr(obj, attr), meta["surfaces"], meta["result"], obj, attr))
-    return found
+def evaluate_directory(experiment: Experiment, directory: str, parents: list[str] | None = None, *, name: str = "", description: str = "") -> Individual:
+    """Make an individual from a directory's genome files, evaluate it, and offer it to the archive.
 
-
-SLOTS = {"archive": "archive", "strategy": "strategy", "operator": "operator", "eval_fn": "evaluator"}
-
-
-def components_of(objects: Iterable[Any]) -> dict[str, Any]:
-    """The swappable parts (archive, strategy, operator, evaluator) of the run these objects belong to."""
-    out: dict[str, Any] = {}
-    for obj in objects:
-        for attr, slot in SLOTS.items():
-            component = getattr(obj, attr, None)
-            if component is not None:
-                out.setdefault(slot, component)
-    return out
-
-
-def component_commands(objects: Iterable[Any], surface: str | None = None) -> dict[str, list[Command]]:
-    """Commands contributed by the archive, strategy, operator, and evaluator, by slot."""
-    out = {}
-    for slot, component in components_of(objects).items():
-        cmds = commands_of(component, surface)
-        if cmds:
-            out[slot] = cmds
-    return out
-
-
-def encode(value: Any) -> Any:
-    """Convert records and results to JSON-compatible data."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Individual):
-        return {
-            "id": value.id,
-            "name": value.name,
-            "description": value.description,
-            "genome": encode(value.genome),
-            "parents": list(value.parents),
-            "evaluation": encode(value.evaluation),
-            "info": encode(dict(value.info)),
-        }
-    if isinstance(value, Evaluation):
-        return value.to_dict()
-    if hasattr(value, "describe"):
-        return encode(value.describe())
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, (_dt.datetime, _dt.date)):
-        return value.isoformat()
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: encode(getattr(value, f.name)) for f in dataclasses.fields(value)}
-    if isinstance(value, dict):
-        return {str(k): encode(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [encode(v) for v in value]
-    if hasattr(value, "to_dict"):
-        return encode(value.to_dict())
-    return repr(value)
-
-
-def injected_arguments(func: Callable, run: Any) -> dict[str, Any]:
-    """Parameters typed RunCommands, filled in rather than passed by the caller."""
-    from evokit.interface.run import RunCommands
-
-    return {name: run for name, hint in typing.get_type_hints(func).items() if hint is RunCommands}
-
-
-def tools(*objects: Any) -> dict[str, Callable]:
-    """Plain synchronous callables for REPL drivers (RLMs, notebooks, scripts), keyed by method name.
-
-    Pass a RunCommands and optionally e.g. FileCommands. Parameters typed RunCommands are filled in.
+    `name` is one line saying what this version is, `description` what changed and why. The
+    result has its evaluation and info.admitted. Edits to environment files (anything outside
+    the genome) are rejected.
     """
-    from evokit.interface.run import RunCommands
+    path = Path(directory)
+    if not path.is_dir():
+        raise UsageError(f"not a directory: {path}")
+    _archive(experiment)
+    parents = [experiment.lookup(p).id for p in parents or []]
+    child = Individual.new(experiment._task().read(path), parents, name=name, description=description)
+    return background.run(experiment.submit(child))
 
-    run = next((o for o in objects if isinstance(o, RunCommands)), None)
 
-    def bind(func: Callable) -> Callable:
-        injected = injected_arguments(func, run)
-        if not injected or run is None:
-            return func
-        rest = inspect.Signature([p for p in inspect.signature(func).parameters.values() if p.name not in injected])
+COMMANDS: dict[str, Callable] = {
+    "status": status,
+    "list-individuals": list_individuals,
+    "checkout-individual": checkout_individual,
+    "evaluate-directory": evaluate_directory,
+}
+"""The commands on an experiment opened with its task; each takes the Experiment first."""
 
-        @functools.wraps(func)
-        def call(*args, **kwargs):
-            return func(**rest.bind(*args, **kwargs).arguments, **injected)
+READ = {tool_name(t): t for t in READ_TOOLS}
+"""The commands that work on any experiment directory, task or not; each takes the Experiment first."""
 
-        call.__signature__ = rest
-        return call
 
-    out: dict[str, Callable] = {}
-    for obj in objects:
-        for cmd in commands_of(obj, "tools"):
-            out[cmd.attr] = bind(cmd.func)
-    for slot, cmds in component_commands(objects, "tools").items():
-        for cmd in cmds:
-            out[f"{slot}_{cmd.attr}"] = bind(cmd.func)
-    return out
+def experiment_tools(experiment: Experiment) -> dict[str, Callable]:
+    """Every command for `experiment`, by name, bound to it: plain synchronous functions (also
+    for a script, a notebook or an RLM). One opened without its task has the read commands."""
+    tools = {name: functools.partial(fn, experiment) for name, fn in READ.items()}
+    if experiment.task is not None:
+        tools |= {name: functools.partial(fn, experiment) for name, fn in COMMANDS.items()}
+    return tools

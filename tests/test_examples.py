@@ -1,7 +1,6 @@
 """The circle-packing algorithm examples, run with scripted agents and models instead of LLMs."""
 
 import asyncio
-import functools
 import http.server
 import json
 import os
@@ -13,18 +12,14 @@ from pathlib import Path
 
 import pytest
 
-from evokit.history import History
-from evokit.agents import AgentResult, CodingAgent
-
-
-@functools.cache
-def history_of(storage) -> History:
-    """One History per storage, as a process keeps one per run."""
-    return History(storage)
-
+import evokit as ek
+from evokit import recipes
+from evokit.agents import Agent, Turn
 
 CIRCLE_PACKING = Path(__file__).resolve().parents[1] / "examples" / "circle_packing"
 sys.path.insert(0, str(CIRCLE_PACKING))
+
+from algorithms.common import packing_task  # noqa: E402
 
 
 SEED_SCORE = 0.9598
@@ -39,37 +34,39 @@ def widen_inner_ring(text: str, step: float = 0.03) -> str:
 async def evokit(env, *args):
     """Run an agent tool the way a shell agent does, and read its JSON reply."""
     proc = await asyncio.to_thread(subprocess.run, ["evokit", *args], capture_output=True, text=True, env={**os.environ, **env})
-    return json.loads(proc.stdout if proc.returncode == 0 else proc.stderr)
+    out = proc.stdout if proc.returncode == 0 else proc.stderr
+    return json.loads(out) if out.lstrip().startswith("{") else out.strip()
 
 
-class ScriptedAgent(CodingAgent):
-    """Widens the inner ring and reports a cost."""
+class ScriptedAgent(Agent):
+    """Widens the inner ring, names the change with finish when asked to, and reports a cost."""
 
     def __init__(self):
         self.prompts, self.sessions = [], []
 
-    async def _run(self, directory, prompt, session=None, env=None):
+    async def _run(self, cwd, prompt, session, env, budget):
         self.prompts.append(prompt)
         self.sessions.append(session)
-        main = Path(directory) / "main.py"
+        main = Path(cwd) / "main.py"
         main.write_text(widen_inner_ring(main.read_text()))
-        return AgentResult("widened the inner ring", usage={"cost_usd": 0.01}, session="session-1")
+        if "evokit finish" in prompt:
+            await evokit(env, "finish", "Widen the inner ring")
+        return Turn("widened the inner ring", usage={"cost_usd": 0.01}, session="session-1")
 
 
 def test_autoresearch_unattended(tmp_path):
-    from algorithms import autoresearch
-
     agent = ScriptedAgent()
-    storage, archive = asyncio.run(autoresearch.run(str(tmp_path / "run"), agent=agent, max_evaluations=3))
-    best = archive.best()
-    assert best.objective("score") > SEED_SCORE and best.objective("lines") == 55
-    assert history_of(storage).usage()["cost_usd"] == pytest.approx(0.03)
-    assert "evokit log" in agent.prompts[0] and "evokit score" not in agent.prompts[0]
-    rows = storage.read("results.tsv").decode().splitlines()
-    assert len(rows) == 3 and rows[0].split("\t")[2] == "keep"
+    best = asyncio.run(recipes.autoresearch(packing_task(), agent, dir=tmp_path / "run", max_evaluations=4))  # the seed and 3 changes
+    experiment = ek.open_experiment(tmp_path / "run")
+    assert best.objective("score") > SEED_SCORE and best.objective("lines") == 55 and experiment.best() == best
+    assert experiment.usage()["cost_usd"] == pytest.approx(0.03)
+    assert "evokit log" in agent.prompts[0] and "evokit submit" not in agent.prompts[0]
+    assert agent.sessions == [None] * 3  # a fresh session for each change
+    rows = experiment.storage.read("results.tsv").decode().splitlines()
+    assert len(rows) == 3 and rows[0].split("\t")[2:] == ["keep", "Widen the inner ring"]
 
 
-class SubmittingAgent(CodingAgent):
+class SubmittingAgent(Agent):
     """AVO's agent, scripted: each session scores and submits twice, a better version and then a
     tie (one more blank line), and stops when a reply says so. As the supervisor, it names a direction."""
 
@@ -81,13 +78,14 @@ class SubmittingAgent(CodingAgent):
         self.replies.append(reply)
         return reply
 
-    async def _run(self, directory, prompt, session=None, env=None):
-        if "evokit submit" not in prompt:
+    async def _run(self, cwd, prompt, session, env, budget):
+        if "evokit submit" not in prompt and session is None:
             self.supervisor_prompts.append(prompt)
-            return AgentResult("1. Try a staggered grid.", usage={"cost_usd": 0.01})
+            await evokit(env, "finish", "--direction", "Try a staggered grid.")
+            return Turn("named a direction", usage={"cost_usd": 0.01})
         self.prompts.append(prompt)
         self.sessions.append(session)
-        main = Path(directory) / "main.py"
+        main = Path(cwd) / "main.py"
         for change in (widen_inner_ring, lambda text: text + "\n"):
             main.write_text(change(main.read_text()))
             draft = await self.call(env, "score")
@@ -95,60 +93,55 @@ class SubmittingAgent(CodingAgent):
                 break
             if "stop" in await self.call(env, "submit", "a change", f"draft score {draft['objectives']}"):
                 break
-        return AgentResult("done for now", usage={"cost_usd": 0.01}, session="session-1")
+        return Turn("done for now", usage={"cost_usd": 0.01}, session="session-1")
 
 
 def test_avo_one_session_submits_and_a_supervisor_redirects(tmp_path):
-    from algorithms import avo
-
     agent = SubmittingAgent()
-    storage, archive = asyncio.run(avo.run(str(tmp_path / "run"), agent=agent, max_evaluations=11, stall_after=6))
+    best = asyncio.run(recipes.avo(packing_task(), agent, dir=tmp_path / "run", max_evaluations=11, stall_after=6))
+    experiment = ek.open_experiment(tmp_path / "run")
     submitted = [r for r in agent.replies if "kept" in r]
     kept = [r["kept"] for r in submitted]
     assert kept == [True] * 6 + [False] * 4  # widening helps three times, then regresses; ties are kept
     assert agent.sessions == [None] + ["session-1"] * 4
     assert "evokit log [ID] [--all]" in agent.prompts[0] and "Continue the loop" in agent.prompts[1]
-    assert archive.best().objective("score") > SEED_SCORE
+    assert best.objective("score") > SEED_SCORE and experiment.best() == best
     (review,) = agent.supervisor_prompts
-    assert "last\n6 attempts" in review and "recent drafts (oldest first): score=" in review
-    assert "+++ workspace" in review and "evokit show ID" in review and "evokit score" not in review
-    assert history_of(storage).counts()["redirect"] == 1
+    assert "last\n6 attempts" in review and "evokit show ID" in review and "evokit score" not in review
+    assert experiment.counts()["review"] == 1 and experiment.counts()["turn"] == 6
     delivered = [str(r.get("message")) for r in agent.replies] + agent.prompts
     assert sum("staggered grid" in d for d in delivered) == 1
     assert agent.replies[-1]["stop"] == "11 evaluations"
-    assert history_of(storage).usage()["draft_evals"] == 10
-    assert history_of(storage).usage()["cost_usd"] == pytest.approx(0.06)
-    assert history_of(storage).individual(submitted[0]["id"]).name == "a change"
+    assert experiment.usage()["draft_evals"] == 10
+    assert experiment.usage()["cost_usd"] == pytest.approx(0.06)
+    assert experiment.individual(submitted[0]["id"]).name == "a change"
 
 
-class StallingAgent(CodingAgent):
+class StallingAgent(Agent):
     """Submits a tie, then never finishes on its own; keeps the budgets it is given."""
 
     def __init__(self):
         self.budgets, self.replies = [], []
 
-    def with_budget(self, usd):
-        self.budgets.append(usd)
-        return self
-
-    async def _run(self, directory, prompt, session=None, env=None):
-        main = Path(directory) / "main.py"
+    async def _run(self, cwd, prompt, session, env, budget):
+        self.budgets.append(budget)
+        main = Path(cwd) / "main.py"
         main.write_text(main.read_text() + "\n")
         self.replies.append(await evokit(env, "submit", "a tie"))
         await asyncio.sleep(600)
 
 
-def test_avo_stops_a_session_once_the_run_is_over(tmp_path, monkeypatch):
-    import evokit.agents.base
-    from algorithms import avo
+def test_avo_stops_the_agent_once_the_experiment_is_over(tmp_path, monkeypatch):
+    import evokit.agents.harness
 
-    monkeypatch.setattr(evokit.agents.base, "STOP_GRACE", 0.2)
+    monkeypatch.setattr(evokit.agents.harness, "STOP_GRACE", 0.2)
     agent = StallingAgent()
-    storage, _ = asyncio.run(avo.run(str(tmp_path / "run"), agent=agent, max_cost=1.0, max_evaluations=2, stall_after=None))
+    asyncio.run(recipes.avo(packing_task(), agent, dir=tmp_path / "run", max_cost=1.0, max_evaluations=2, stall_after=None))
     assert agent.replies == [{**agent.replies[0], "kept": True, "stop": "2 evaluations"}]
     assert agent.budgets == [1.0]
-    notes = {r["note"]: r for r in history_of(storage).records() if r["kind"] == "note"}
-    assert notes["stop"]["text"] == "2 evaluations" and notes["session"]["text"].startswith("1 submitted")
+    experiment = ek.open_experiment(tmp_path / "run")
+    assert experiment.last_note("stop") == "2 evaluations" and experiment.notes("turn")[0]["stopped"] == "2 evaluations"
+    assert not experiment.notes("failed")
 
 
 class FakeMessagesAPI(http.server.BaseHTTPRequestHandler):
@@ -197,8 +190,10 @@ def test_dgm_agents_modify_themselves(tmp_path, fake_anthropic, variant):
     from algorithms.dgm import main as dgm
 
     directory = tmp_path / "run"
-    storage, archive = asyncio.run(dgm.run(str(directory), variant, workers=2, max_children=2))
-    seed, *children = sorted(history_of(storage).evaluated(), key=lambda i: len(i.parents))
+    asyncio.run(dgm.run(str(directory), variant, workers=2, max_children=2))
+    experiment = ek.open_experiment(directory)
+    storage = experiment.storage
+    seed, *children = sorted(experiment.evaluated(), key=lambda i: len(i.parents))
     assert seed.objective("solves") == 3 and seed.objective("stage2") > 0.6
     assert storage.exists(f"artifacts/{seed.id}/logs/stage1-n26.md")
     assert len(children) == 2 and all(c.parents == (seed.id,) and c.evaluation.objectives for c in children)
@@ -208,8 +203,8 @@ def test_dgm_agents_modify_themselves(tmp_path, fake_anthropic, variant):
     assert all(c.objective("stage2") > seed.objective("stage2") for c in children)
     assert all(c.objective("solves") == 9 for c in children)
     # solves, plus a diagnosis and an implementation per child; two $0.0045 calls each
-    assert history_of(storage).usage()["cost_usd"] == pytest.approx(0.009 * (3 + 2 * 9 + 4))
-    dgm.report(storage, archive)
+    assert experiment.usage()["cost_usd"] == pytest.approx(0.009 * (3 + 2 * 9 + 4))
+    dgm.report(str(directory))
     assert "0.43 * math.sin" in (directory / "best_main.py").read_text()
     assert (directory / "best_agent" / "agent.py").is_file()
 
@@ -241,12 +236,14 @@ def test_openevolve_islands_inspirations_and_ensemble(tmp_path):
 
     prompts = []
     models = {"fast": ring_diff_model(1, 0.001, prompts), "strong": ring_diff_model(2, 0.01, prompts)}
-    storage, archive = asyncio.run(openevolve.run(str(tmp_path / "run"), "full", models=models, workers=4, max_evaluations=40))
-    best = archive.best()
+    best = asyncio.run(openevolve.run(str(tmp_path / "run"), "full", models=models, workers=4, max_evaluations=40))
+    experiment = ek.open_experiment(tmp_path / "run")
+    archive = experiment.archive
+    assert archive.best() == best
     assert best.objective("score") > SEED_SCORE + 0.01 and best.objective("lines") is not None
     assert all(archive.island_members(i) for i in range(4))
     assert any(len({key for key in archive.niches() if key[0] == i}) > 1 for i in range(4))
-    assert {i.info.get("operator", "seed") for i in history_of(storage).evaluated()} == {"seed", "fast", "strong"}
+    assert {i.info.get("operator", "seed") for i in experiment.evaluated()} == {"seed", "fast", "strong"}
     assert sum("Other programs, for inspiration" in p for p in prompts) > len(prompts) / 2
     assert all("EVOLVE-BLOCK" in p for p in prompts)
     print(archive.table(0))
@@ -258,8 +255,9 @@ def test_openevolve_variants_run(tmp_path, variant):
 
     prompts = []
     models = {"fast": ring_diff_model(1, 0.001, prompts), "strong": ring_diff_model(2, 0.01, prompts)}
-    storage, archive = asyncio.run(openevolve.run(str(tmp_path / "run"), variant, models=models, workers=4, max_evaluations=12))
-    assert archive.best().objective("score") > SEED_SCORE
+    best = asyncio.run(openevolve.run(str(tmp_path / "run"), variant, models=models, workers=4, max_evaluations=12))
+    archive = ek.open_experiment(tmp_path / "run").archive
+    assert best.objective("score") > SEED_SCORE
     islands = sum(1 for i in range(archive.islands) if archive.island_members(i))
     assert islands == (1 if variant == "one-island" else 4)
     if variant == "no-inspirations":
@@ -276,9 +274,10 @@ def test_openevolve_rejects_edits_outside_the_block(tmp_path):
     edit = "    sum_radii = np.sum(radii)\n=======\n    sum_radii = 3.0\n"
     outside = Completion(f"main.py\n<<<<<<< SEARCH\n{edit}>>>>>>> REPLACE\n", {"cost_usd": 0.01})
     model = FunctionModel(lambda p: outside)
-    storage, _ = asyncio.run(openevolve.run(str(tmp_path / "run"), "single-model", models={"fast": model}, workers=1, max_cost=0.1))
-    failed = [r for r in history_of(storage).records() if r["kind"] == "note" and r["note"] == "failed"]
+    asyncio.run(openevolve.run(str(tmp_path / "run"), "single-model", models={"fast": model}, workers=1, max_cost=0.1))
+    experiment = ek.open_experiment(tmp_path / "run")
+    failed = experiment.notes("failed")
     assert len(failed) >= 10 and "outside its EVOLVE-BLOCK" in failed[0]["text"]
-    assert history_of(storage).usage()["cost_usd"] == pytest.approx(0.01 * len(failed))
-    assert history_of(storage).counts()["evaluated"] == 1
+    assert experiment.usage()["cost_usd"] == pytest.approx(0.01 * len(failed))
+    assert experiment.counts()["evaluated"] == 1
 

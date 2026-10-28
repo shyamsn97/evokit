@@ -1,25 +1,21 @@
-"""Coding agents, and the operators that use them to edit a Files genome."""
+"""Coding agents: the harness interface, the harnesses EvoKit ships, and how their tools reach them."""
 
-from evokit.agents.base import AgentResult, CodingAgent
-from evokit.agents.claude import ClaudeCode
+from evokit.agents.claude import NO_SHELL, ClaudeCode
 from evokit.agents.command import CommandAgent
-from evokit.agents.meta_agent import MetaAgentModify, write_history
-from evokit.agents.operator import CodingAgentOperator
+from evokit.agents.harness import Agent, Event, Prompt, Session, ToolCall, Turn
 from evokit.agents.repl import ReplAgent
-from evokit.agents.self_modify import SelfModify, script_agent
-from evokit.agents.tools import ToolServer, agent_tools
+from evokit.agents.tools import ShellTools
 
 __all__ = [
-    "AgentResult",
+    "NO_SHELL",
+    "Agent",
     "ClaudeCode",
-    "CodingAgent",
-    "CodingAgentOperator",
     "CommandAgent",
-    "MetaAgentModify",
+    "Event",
+    "Prompt",
     "ReplAgent",
-    "SelfModify",
-    "ToolServer",
-    "agent_tools",
-    "script_agent",
-    "write_history",
+    "Session",
+    "ShellTools",
+    "ToolCall",
+    "Turn",
 ]

@@ -1,7 +1,7 @@
 """The optional files package: Files genomes over a project directory."""
 
 import asyncio
-import functools
+import dataclasses
 import json
 import os
 import subprocess
@@ -11,15 +11,11 @@ import time
 import pytest
 
 import evokit as ek
-from evokit.history import History
-from evokit.archives import BestArchive
-from evokit.agents import AgentResult, ClaudeCode, CodingAgent, CodingAgentOperator, CommandAgent, ReplAgent
-from evokit.agents.tools import ToolServer, agent_tools, limited, parse_argv
+from evokit.agents import Agent, ClaudeCode, CommandAgent, ReplAgent, Turn
+from evokit.agents.tools import ShellTools, limited, parse_argv
 from evokit.agents.repl import CONFIRM
 from evokit.agents.repl_server import Repl
 from evokit.files import (
-    DiffOperator,
-    FileCommands,
     Files,
     Project,
     ScriptEvaluator,
@@ -28,18 +24,50 @@ from evokit.files import (
     parse_metrics,
     with_lines,
 )
-from evokit.interface.run import RunCommands
-from evokit.operators import FunctionModel
+from evokit.experiment import agent_tools
+from evokit.interface.commands import checkout_individual, evaluate_directory
+from evokit.operators import FunctionModel, diff
 from evokit.storage import decode_genome, encode_genome
-from evokit.storages import DirectoryStorage, MemoryStorage
-from evokit.strategies import Greedy
+from evokit.storages import MemoryStorage
 from evokit.util import glob_match
 
 
-@functools.cache
-def history_of(storage) -> History:
-    """One History per storage, as a process keeps one per run."""
-    return History(storage)
+def files_task(seed, genome=("main.py",)) -> ek.Task:
+    """The seed folder as a task: `genome` evolves, scored by its evaluate.py."""
+    project = Project(seed, genome=list(genome))
+    return ek.Task(project.seed_genome(), ScriptEvaluator(project, "python evaluate.py"), files=project)
+
+
+def climbed(seed, make, **limits) -> ek.Experiment:
+    """An experiment on the seed folder, each child made from the best by `make(parent, task)`."""
+    task = files_task(seed)
+    experiment = task.create_experiment(**limits)
+
+    async def go():
+        while not experiment.limits.reached():
+            (parent,) = experiment.archive.sample(1)
+            if child := await experiment.create(make(parent, task)):
+                await experiment.submit(child)
+
+    asyncio.run(go())
+    return experiment
+
+
+def researched(seed, agent, genome=("main.py",), **limits) -> ek.Experiment:
+    """`recipes.autoresearch` on the seed folder with `agent`; the experiment, reopened to read."""
+    dir = seed.parent / f"run-{ek.util.new_id()}"
+    asyncio.run(ek.recipes.autoresearch(files_task(seed, genome), agent, dir=dir, **limits))
+    return ek.open_experiment(dir)
+
+
+def prompt(agent, text, cwd, tools=(), resume=None, env=None, budget=None, system=None, output=None) -> Turn:
+    """One prompt in a new session."""
+
+    async def go():
+        async with agent.session(cwd, tools, resume, env, system=system) as session:
+            return await session.prompt(text, budget, output=output)
+
+    return asyncio.run(go())
 
 
 def test_glob():
@@ -121,47 +149,19 @@ def test_script_evaluator_returns_workdir_files_as_logs(tmp_path):
     assert evaluation.objectives == {"score": 1.0} and evaluation.logs == {"log.txt": b"hello"}
 
 
-class FileRun:
-    """A Files run in memory: the project, its eval function, a seeded archive, and a loop."""
-
-    def __init__(self, seed, operator_for=None):
-        self.project = Project(seed, genome=["main.py"])
-        self.eval_fn = ScriptEvaluator(self.project, "python evaluate.py")
-        self.operator = operator_for(self.project) if operator_for else None
-        self.storage = MemoryStorage()
-        self.archive = BestArchive(storage=self.storage)
-        asyncio.run(self._seed())
-
-    async def _seed(self):
-        seeds = [ek.Individual.new(self.project.seed_genome())]
-        await ek.tell(history_of(self.storage), self.archive, seeds, await asyncio.gather(*map(ek.as_eval_fn(self.eval_fn), seeds)))
-
-    def run(self, evaluations, max_cost=None):
-        async def go():
-            while history_of(self.storage).counts()["evaluated"] < evaluations:
-                if max_cost is not None and history_of(self.storage).usage()["cost_usd"] >= max_cost:
-                    return
-                asked = await ek.ask(history_of(self.storage), self.archive, Greedy(), self.operator)
-                scores = await asyncio.gather(*map(ek.as_eval_fn(self.eval_fn), asked.individuals))
-                await ek.tell(history_of(self.storage), self.archive, asked.individuals, scores)
-
-        asyncio.run(go())
-
-
 def bump_diff(prompt):
     x = float(prompt.split("X = ")[1].split("\n")[0])
     return f"main.py\n<<<<<<< SEARCH\nX = {x}\n=======\nX = {x + 1.0}\n>>>>>>> REPLACE\n"
 
 
-def test_diff_operator_hill_climb(seed):
-    run = FileRun(seed, lambda p: DiffOperator(FunctionModel(bump_diff), p))
-    run.run(5)
-    assert run.archive.best().genome.text("main.py") == "X = 3.0\n"
-    # 4.0 fails the evaluator, so it is rejected (twice: Greedy keeps trying from 3.0)
-    assert [bool(i.evaluation.objectives) for i in history_of(run.storage).evaluated()] == [True, True, True, False, False]
+def test_diff_hill_climb(seed):
+    e = climbed(seed, lambda parent, task: diff(FunctionModel(bump_diff), parent, task=task), max_evaluations=5)
+    assert e.best().genome.text("main.py") == "X = 3.0\n"
+    # 4.0 fails the evaluator, so it is rejected (twice: the best stays 3.0)
+    assert [bool(i.evaluation.objectives) for i in e.evaluated()] == [True, True, True, False, False]
 
 
-def test_diff_operator_inspirations_and_evolve_blocks():
+def test_diff_inspirations_and_evolve_blocks():
     prompts = []
 
     def model(prompt):
@@ -171,73 +171,64 @@ def test_diff_operator_inspirations_and_evolve_blocks():
     text = "HEADER = 1\n# EVOLVE-BLOCK-START\nX = 1\n# EVOLVE-BLOCK-END\n"
     parent = ek.Individual.new(Files.from_dict({"main.py": text})).with_evaluation(ek.Evaluation({"score": 1.0}))
     other = ek.Individual.new(Files.from_dict({"main.py": "X = 9\n"})).with_evaluation(ek.Evaluation({"score": 9.0}))
-    operator = DiffOperator(FunctionModel(model))
     with pytest.raises(ek.OperatorError, match="outside its EVOLVE-BLOCK"):
-        asyncio.run(operator.create(ek.Selection((parent,), (other,)), BestArchive()))
+        asyncio.run(diff(FunctionModel(model), parent, [other]))
     assert "for inspiration" in prompts[0] and "X = 9" in prompts[0] and "EVOLVE-BLOCK-END markers" in prompts[0]
 
-    inside = DiffOperator(FunctionModel(lambda p: "<<<<<<< SEARCH\nX = 1\n=======\nX = 2\n>>>>>>> REPLACE\n"))
-    (child,) = asyncio.run(inside.create(ek.Selection((parent,)), BestArchive())).children
+    inside = FunctionModel(lambda p: "<<<<<<< SEARCH\nX = 1\n=======\nX = 2\n>>>>>>> REPLACE\n")
+    child, _ = asyncio.run(diff(inside, parent))
     assert child.genome.text("main.py") == text.replace("X = 1", "X = 2") and child.parents == (parent.id,)
 
 
-def test_file_commands(seed, tmp_path):
-    run = FileRun(seed)
-    commands = FileCommands(run.project)
-    runs = RunCommands(run.storage, run.archive, Greedy(), None, run.eval_fn)
-    seed_individual = run.archive.best()
+def test_checkout_and_evaluate_a_directory(seed, tmp_path):
+    e = files_task(seed).create_experiment()
+    seed_individual = e.best()
     work = tmp_path / "work"
-    commands.checkout_individual(seed_individual, str(work))
+    checkout_individual(e, seed_individual.id, str(work))
     with pytest.raises(ek.UsageError, match="not empty"):
-        commands.checkout_individual(seed_individual, str(work))
+        checkout_individual(e, seed_individual.id, str(work))
     (work / "main.py").write_text("X = 2.5\n")
-    individual = commands.evaluate_directory(runs, str(work), [seed_individual.id], "closer", "X from 1 to 2.5")
+    individual = evaluate_directory(e, str(work), [seed_individual.id], name="closer", description="X from 1 to 2.5")
     assert individual.evaluation.objectives == {"score": -0.5} and individual.name == "closer"
     assert individual.description == "X from 1 to 2.5" and individual.info["admitted"]
-    assert "+X = 2.5" in runs.history.diff(individual)
-    assert runs.history.show(individual, "main.py") == "X = 2.5\n"
-    edited = commands.edit_individual(runs, individual, {"main.py": "X = 3.0\n"})
-    assert edited.parents == (individual.id,) and edited.info["admitted"]
-    with pytest.raises(ek.UsageError, match="not genome files"):
-        commands.edit_individual(runs, individual, {"evaluate.py": "cheat"})
+    assert "+X = 2.5" in e.diff(individual)
+    assert e.show(individual, "main.py") == "X = 2.5\n"
     with pytest.raises(ek.UsageError, match="no individual"):
-        commands.evaluate_directory(runs, str(work), ["nope"])
+        evaluate_directory(e, str(work), ["nope"])
 
 
-def test_coding_agent_operator(seed, fake_agent):
-    run = FileRun(seed)
-    run.operator = CodingAgentOperator(
-        CommandAgent(fake_agent), run.project, eval_fn="python evaluate.py", history=history_of(run.storage), max_draft_evals=3
-    )
-    run.run(3)
-    best = run.archive.best()
-    assert best.genome.text("main.py") == "X = 2.0\n" and best.info["operator"] == "coding-agent"
-    assert "draft={'score': -1.0}" in best.name
-    used = history_of(run.storage).usage()
-    assert used["draft_evals"] == 2 and history_of(run.storage).counts()["evaluated"] == 3
+def test_an_agent_makes_children_by_editing_their_parent(seed, fake_agent):
+    e = researched(seed, CommandAgent(fake_agent), max_evaluations=3)
+    best = e.best()
+    assert best.genome.text("main.py") == "X = 2.0\n" and best.info["operator"] == "agent"
+    assert "draft={'score': -1.0" in best.name and best.description == "bumped X"
+    used = e.usage()
+    assert used["draft_evals"] == 2 and e.counts()["evaluated"] == 3 and e.counts()["turn"] == 2
     assert used["cost_usd"] == pytest.approx(0.02)
 
 
-def test_agent_tools_run_from_the_shell_and_stop_with_the_run(seed):
-    run = FileRun(seed)
-    history = history_of(run.storage)
-    tools = agent_tools(run.archive, history, run.eval_fn, project=run.project, workspace=seed)
-    reasons = [None, None, None, None, "$5 spent"]
+def test_experiment_tools_run_from_the_shell_and_stop_with_the_session(seed, tmp_path):
+    e = files_task(seed).create_experiment()
+    checkout = e.task.checkout(e.task.seed, tmp_path / "work")
+    session = Agent().session(checkout, agent_tools(e, checkout, submitting=False))
+    assert "submit" not in session.tools and {"log", "score", "remember"} <= set(session.tools)
 
     async def go():
-        async with ToolServer(tools, stop=lambda: reasons.pop(0)) as server:
-            env = {**os.environ, **server.env}
+        async with ShellTools(session) as shell:
+            env = {**os.environ, **shell.env}
 
             def evokit(*args):
                 return asyncio.to_thread(subprocess.run, ["evokit", *args], capture_output=True, text=True, env=env)
 
-            return await evokit("score"), await evokit("log", "--all"), await evokit("show", run.archive.best().id, "main.py")
+            scored, logged = await evokit("score"), await evokit("log", "--all")
+            session.stop("$5 spent")
+            return scored, logged, await evokit("show", e.best().id, "main.py")
 
     scored, logged, shown = asyncio.run(go())
     assert scored.returncode == 0 and json.loads(scored.stdout)["objectives"] == {"score": -2.0}
-    assert [e["id"] for e in json.loads(logged.stdout)] == [run.archive.best().id]
+    assert [entry["id"] for entry in json.loads(logged.stdout)] == [e.best().id]
     assert shown.returncode == 1 and json.loads(shown.stderr)["stop"] == "$5 spent"
-    assert history.usage()["draft_evals"] == 1
+    assert e.usage()["draft_evals"] == 1
 
 
 def test_tools_take_their_arguments_from_the_signature():
@@ -264,35 +255,25 @@ import json, subprocess, sys
 told = "evokit log" in sys.stdin.read()
 log = json.loads(subprocess.run(["evokit", "log", "--all"], capture_output=True, text=True).stdout)
 open("main.py", "w").write("X = 2.0\\n")
-print(json.dumps({"summary": f"told={told} seen={len(log)}\\n\\nread the run first"}))
+subprocess.run(["evokit", "finish", "--title", f"told={told} seen={len(log)}", "--description", "read the experiment first"])
+print(json.dumps({"summary": "done"}))
 """
 
 
-def test_coding_agent_can_read_the_run(seed, tmp_path):
+def test_an_agent_can_read_the_experiment(seed, tmp_path):
     script = tmp_path / "reading_agent.py"
     script.write_text(READING_AGENT)
-    project = Project(seed, genome=["**"])
-    eval_fn = ScriptEvaluator(project, "python evaluate.py")
-    storage = DirectoryStorage(tmp_path / "run")
-    archive = BestArchive(storage=storage)
-    operator = CodingAgentOperator(CommandAgent([sys.executable, str(script)]), project, history=history_of(storage))
-
-    async def go():
-        seeds = [ek.Individual.new(project.seed_genome())]
-        await ek.tell(history_of(storage), archive, seeds, await asyncio.gather(*map(ek.as_eval_fn(eval_fn), seeds)))
-        return await ek.ask(history_of(storage), archive, Greedy(), operator)
-
-    (child,) = asyncio.run(go()).individuals
-    assert child.name == "told=True seen=1" and child.description == "read the run first"
+    e = researched(seed, CommandAgent([sys.executable, str(script)]), genome=["**"], max_evaluations=2)
+    child = e.evaluated()[-1]
+    assert child.name == "told=True seen=1" and child.description == "read the experiment first"
 
 
-def test_coding_agent_tampering_rejected(seed, fake_agent, monkeypatch):
+def test_an_agent_that_edits_the_environment_is_rejected(seed, fake_agent, monkeypatch):
     monkeypatch.setenv("TAMPER", "1")
-    run = FileRun(seed, lambda p: CodingAgentOperator(CommandAgent(fake_agent), p))
-    run.run(2, max_cost=0.01)
-    failed = [r for r in history_of(run.storage).records() if r["kind"] == "note" and r["note"] == "failed"]
+    e = researched(seed, CommandAgent(fake_agent), max_evaluations=2, max_cost=0.01)
+    failed = e.notes("failed")
     assert failed and "evaluate.py" in failed[0]["text"]
-    assert history_of(run.storage).usage()["cost_usd"] == pytest.approx(0.01)
+    assert e.usage()["cost_usd"] == pytest.approx(0.01)
 
 
 LINGERING_CLAUDE = """#!{python}
@@ -311,9 +292,9 @@ def test_claude_code_returns_once_it_prints_its_result(tmp_path):
     agent = ClaudeCode(binary=str(binary))
     agent.exit_grace = 0.5
     start = time.monotonic()
-    result = asyncio.run(agent.run(tmp_path, "improve it"))
+    result = prompt(agent, "improve it", tmp_path)
     assert time.monotonic() - start < 10
-    assert result.error is None and result.summary == "edited main.py" and result.session == "s1"
+    assert result.error is None and result.text == "edited main.py" and result.session == "s1"
     assert result.usage == {"tokens": 15, "turns": 3, "cost_usd": 0.25}
 
 
@@ -335,76 +316,120 @@ def test_claude_code_check_reports_what_claude_said(tmp_path):
 def test_claude_code_budget_is_passed_and_only_lowered(tmp_path):
     binary = fake_claude(tmp_path, 'print(json.dumps({"type": "result", "result": " ".join(sys.argv[1:])}))')
     agent = ClaudeCode(binary=binary, max_budget_usd=2.0)
-    assert "--max-budget-usd 0.5" in asyncio.run(agent.with_budget(0.5).run(tmp_path, "hi")).summary
-    assert agent.with_budget(3.0).max_budget_usd == 2.0 and agent.max_budget_usd == 2.0
-    assert agent.with_budget(None) is agent
+    assert "--max-budget-usd 0.5" in prompt(agent, "hi", tmp_path, budget=0.5).text
+    assert "--max-budget-usd 2.0" in prompt(agent, "hi", tmp_path, budget=3.0).text
+    assert "--max-budget-usd 2.0" in prompt(agent, "hi", tmp_path).text
 
 
-METERED_CLAUDE = """
-model = "claude-test-meter"
-def emit(event): print(json.dumps(event), flush=True)
-def stream(event): emit({"type": "stream_event", "event": event})
-if "Reply with OK." in sys.argv:
-    usage = {"inputTokens": 10, "outputTokens": 2, "cacheCreationInputTokens": 8, "cacheReadInputTokens": 100}
-    emit({"type": "result", "result": "OK", "modelUsage": {model: {**usage, "costUSD": 40 * 2e-6}}})
-    sys.exit()
-emit({"type": "system", "argv": sys.argv})
-stream({"type": "message_start", "message": {"id": "m1", "model": model, "usage": {"input_tokens": 100, "output_tokens": 1}}})
-stream({"type": "content_block_delta", "delta": {"text": "hi"}})
-stream({"type": "message_delta", "usage": {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 1000}})
-emit({"type": "result", "result": "done", "total_cost_usd": 0.0011})
+@dataclasses.dataclass
+class Named:
+    """What it is."""
+
+    title: str
+    tags: list[str] = dataclasses.field(default_factory=list)
+
+
+ECHO = 'import json, sys; print(json.dumps({"summary": sys.stdin.read()}))'
+
+FINISHING = """
+import json, subprocess, sys
+prompt = sys.stdin.read()
+if "{when}" in prompt:
+    subprocess.run(["evokit", "finish", "named", "--tag", "a", "--tag", "b"])
+    late = subprocess.run(["evokit", "stats"], capture_output=True, text=True)
+    print(late.stderr.strip(), file=sys.stderr)
+print(json.dumps({{"summary": "ok", "cost_usd": 0.01}}))
 """
 
 
-def test_claude_code_reports_its_cost_as_it_goes(tmp_path):
-    agent = ClaudeCode(binary=fake_claude(tmp_path, METERED_CLAUDE))
-    asyncio.run(agent.check())  # teaches the model's rate: $40 x 2e-6 for 40 input-token units
-    costs = []
-    result = asyncio.run(agent.with_meter(costs.append).run(tmp_path, "improve it"))
-    assert costs == [pytest.approx(105 * 2e-6), pytest.approx(450 * 2e-6)]  # input + 5 x output + 0.1 x cache reads
-    assert "--include-partial-messages" in result.transcript and "stream_event" not in result.transcript
-    assert result.usage["cost_usd"] == 0.0011
-    assert "--include-partial-messages" not in " ".join(agent.argv("hi", None))
+def test_the_system_prompt_reaches_each_harness(tmp_path):
+    binary = fake_claude(tmp_path, 'print(json.dumps({"type": "result", "result": " ".join(sys.argv[1:])}))')
+    assert "--append-system-prompt BE TERSE" in prompt(ClaudeCode(binary=binary), "hi", tmp_path, system="BE TERSE").text
+
+    model = ScriptedModel(["Done.", "Done."])
+    prompt(ReplAgent(model, system="base"), "hi", tmp_path, system="BE TERSE")
+    assert model.seen[0][0] == {"role": "system", "content": "base\n\nBE TERSE"}
+
+    async def twice():
+        async with CommandAgent([sys.executable, "-c", ECHO]).session(tmp_path, system="BE TERSE") as session:
+            return (await session.prompt("first")).text, (await session.prompt("second")).text
+
+    first, second = asyncio.run(twice())
+    assert first == "BE TERSE\n\nfirst" and second == "second"
+
+
+def test_output_comes_from_the_finish_tool(tmp_path):
+    script = tmp_path / "finishing.py"
+    script.write_text(FINISHING.format(when="evokit finish"))
+    turn = prompt(CommandAgent([sys.executable, str(script)]), "name it", tmp_path, output=Named)
+    assert turn.output == Named("named", ["a", "b"]) and turn.error is None and turn.calls == ("finish",)
+    assert "you already called finish" in turn.trace
+
+    model = ScriptedModel([repl("finish(title='from python')"), "Done.", "Done."])
+    turn = prompt(ReplAgent(model), "name it", tmp_path, output=Named)
+    assert turn.output == Named("from python") and "`finish(title: str, tags: list[str] = [])`" in model.seen[0][1]["content"]
+
+
+def test_an_agent_that_does_not_finish_is_asked_once_more(tmp_path):
+    script = tmp_path / "late.py"
+    script.write_text(FINISHING.format(when="You have not called"))
+    turn = prompt(CommandAgent([sys.executable, str(script)]), "name it", tmp_path, output=Named)
+    assert turn.output == Named("named", ["a", "b"]) and turn.usage["cost_usd"] == pytest.approx(0.02)
+
+    turn = prompt(CommandAgent([sys.executable, "-c", ECHO]), "name it", tmp_path, output=Named)
+    assert turn.output is None and turn.error == "the agent ended its turn without calling finish"
+    assert turn.text.startswith("You have not called `evokit finish TITLE [--tag TAG ...]` yet")
+
+
+def test_claude_code_allowed_tools_deny_everything_else(tmp_path):
+    from evokit.agents import NO_SHELL
+
+    binary = fake_claude(tmp_path, 'print(json.dumps({"type": "result", "result": " ".join(sys.argv[1:])}))')
+    argv = prompt(ClaudeCode(binary=binary, allowed_tools=NO_SHELL), "hi", tmp_path).text
+    assert "--permission-mode dontAsk --allowedTools Read,Edit,Write,Glob,Grep,Bash(evokit *)" in argv
+    assert "bypassPermissions" not in argv
+    assert "--permission-mode bypassPermissions" in prompt(ClaudeCode(binary=binary), "hi", tmp_path).text
 
 
 def test_claude_code_login_auth_drops_the_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-bad")
     binary = fake_claude(tmp_path, 'print(json.dumps({"type": "result", "result": str("ANTHROPIC_API_KEY" in os.environ)}))')
-    assert asyncio.run(ClaudeCode(binary=binary).run(tmp_path, "hi")).summary == "True"
-    assert asyncio.run(ClaudeCode(binary=binary, auth="login").run(tmp_path, "hi")).summary == "False"
+    assert prompt(ClaudeCode(binary=binary), "hi", tmp_path).text == "True"
+    assert prompt(ClaudeCode(binary=binary, auth="login"), "hi", tmp_path).text == "False"
 
 
-class EditsThenFails(CodingAgent):
+class EditsThenFails(Agent):
     def __init__(self, edit: bool):
         self.edit = edit
 
-    async def _run(self, directory, prompt, session=None, env=None):
+    async def _run(self, cwd, prompt, session, env, budget):
         if self.edit:
-            (directory / "main.py").write_text("X = 2.0\n")
-        return AgentResult("", {"cost_usd": 0.01}, error="reached the turn limit", transcript='{"type": "system"}\n')
+            (cwd / "main.py").write_text("X = 2.0\n")
+        return Turn("", {"cost_usd": 0.01}, error="reached the turn limit", transcript='{"type": "system"}\n')
 
 
 def test_an_agent_that_fails_after_editing_still_makes_a_child(seed):
-    run = FileRun(seed, lambda p: CodingAgentOperator(EditsThenFails(edit=True), p))
-    run.run(2)
-    child = history_of(run.storage).evaluated()[-1]
+    e = researched(seed, EditsThenFails(edit=True), max_evaluations=2)
+    child = e.evaluated()[-1]
     assert child.genome.text("main.py") == "X = 2.0\n" and child.info["agent_error"] == "reached the turn limit"
+    (turn,) = e.notes("turn")
+    assert turn["error"] == "reached the turn limit" and e.storage.read(turn["transcript"]) == b'{"type": "system"}\n'
 
-    assert run.storage.read(f"artifacts/{child.id}/agent.jsonl") == b'{"type": "system"}\n'
-
-    run = FileRun(seed, lambda p: CodingAgentOperator(EditsThenFails(edit=False), p))
-    run.run(2, max_cost=0.01)
-    failed = history_of(run.storage).last_note("failed")
-    assert "reached the turn limit" in failed
-    folder = failed.split("logs: ")[1].strip()
-    assert run.storage.read(folder + "agent.jsonl") == b'{"type": "system"}\n'
+    e = researched(seed, EditsThenFails(edit=False), max_evaluations=2, max_cost=0.01)
+    assert "reached the turn limit" in e.last_note("failed")
+    assert e.storage.read(e.notes("turn")[0]["transcript"]) == b'{"type": "system"}\n'
 
 
 DRIVER = """
 import asyncio, sys
 from pathlib import Path
 from evokit.agents import ClaudeCode
-asyncio.run(ClaudeCode(binary=sys.argv[1]).run(Path(sys.argv[2]), "hi"))
+
+async def main():
+    async with ClaudeCode(binary=sys.argv[1]).session(Path(sys.argv[2])) as session:
+        await session.prompt("hi")
+
+asyncio.run(main())
 """
 
 
@@ -443,6 +468,8 @@ events = [
     {"type": "result", "result": "set X to 2", "num_turns": 2},
 ]
 open("main.py", "w").write("X = 2.0\\n")
+if any("evokit finish" in a for a in sys.argv):
+    subprocess.run(["evokit", "finish", "--title", "set X to 2"], capture_output=True)
 for event in events:
     print(json.dumps(event), flush=True)
 """
@@ -451,12 +478,10 @@ for event in events:
 def test_claude_code_logs_each_step_and_keeps_its_transcript(seed, tmp_path, caplog):
     binary = fake_claude(tmp_path, WORKING_CLAUDE)
     caplog.set_level("INFO", logger="evokit")
-    run = FileRun(seed, lambda p: CodingAgentOperator(ClaudeCode(binary=binary), p))
-    run.run(2)
-    child = history_of(run.storage).evaluated()[-1]
-    assert child.genome.text("main.py") == "X = 2.0\n"
+    e = researched(seed, ClaudeCode(binary=binary), max_evaluations=2)
+    assert e.evaluated()[-1].genome.text("main.py") == "X = 2.0\n" and e.evaluated()[-1].name == "set X to 2"
     assert "agent: 'Trying a bigger X.'" in caplog.messages and "agent: Edit main.py" in caplog.messages
-    transcript = run.storage.read(f"artifacts/{child.id}/agent.jsonl").decode().splitlines()
+    transcript = e.storage.read(e.notes("turn")[0]["transcript"]).decode().splitlines()
     assert len(transcript) == 3 and '"set X to 2"' in transcript[-1]
 
 
@@ -496,8 +521,8 @@ def test_repl_agent_keeps_state_and_sees_output(tmp_path):
         "Set X to 2\n\nIt was 1.",
         "Set X to 2\n\nIt was 1.",
     ])
-    result = asyncio.run(ReplAgent(model).run(tmp_path, "make X 2", env={"EVOKIT_DIR": "/the/run"}))
-    assert result.error is None and result.summary == "Set X to 2\n\nIt was 1."
+    result = prompt(ReplAgent(model), "make X 2", tmp_path, env={"EVOKIT_DIR": "/the/run"})
+    assert result.error is None and result.text == "Set X to 2\n\nIt was 1."
     assert (tmp_path / "main.py").read_text() == "X = 2\n"
     assert result.usage == {"cost_usd": pytest.approx(0.5), "tokens": 50, "turns": 5}
     outputs = [m[-1]["content"] for m in model.seen[1:]]
@@ -511,7 +536,7 @@ def test_repl_agent_keeps_state_and_sees_output(tmp_path):
     resumed = ScriptedModel(["Nothing to do\n\nDone."] * 2)
     agent = ReplAgent(resumed)
     agent.sessions = {result.session: json.loads("[" + ",".join(result.transcript.splitlines()) + "]")}
-    again = asyncio.run(agent.run(tmp_path, "anything else?", session=result.session))
+    again = prompt(agent, "anything else?", tmp_path, resume=result.session)
     assert again.session == result.session and len(resumed.seen[0]) == 12
     assert resumed.seen[0][-1]["content"].endswith("anything else?") and "restarted" in resumed.seen[0][-1]["content"]
 
@@ -522,7 +547,7 @@ def test_repl_agent_calls_tools_as_python_functions(tmp_path):
         return a + b
 
     model = ScriptedModel([repl("print(add(2, b=3))\nadd()"), "Added\n\nDone.", "Added\n\nDone."])
-    result = asyncio.run(ReplAgent(model).run(tmp_path, "add them", tools=[add], stop=lambda: None))
+    result = prompt(ReplAgent(model), "add them", tmp_path, tools=[add])
     assert result.error is None and "- `add(a: int, b: int = 1) -> int`: Add two numbers." in model.seen[0][1]["content"]
     output = model.seen[1][-1]["content"]
     assert "5\n" in output and "RuntimeError: missing a required argument: 'a' (add(a: int, b: int = 1) -> int)" in output
@@ -530,23 +555,22 @@ def test_repl_agent_calls_tools_as_python_functions(tmp_path):
 
 def test_repl_agent_asks_again_when_a_reply_only_says_what_it_will_do(tmp_path):
     model = ScriptedModel(["I'll write a.txt now.", repl("open('a.txt', 'w').write('1')"), "Wrote a.txt\n\nDone.", "Wrote a.txt\n\nDone."])
-    result = asyncio.run(ReplAgent(model).run(tmp_path, "write a.txt"))
-    assert result.error is None and result.summary == "Wrote a.txt\n\nDone." and (tmp_path / "a.txt").read_text() == "1"
+    result = prompt(ReplAgent(model), "write a.txt", tmp_path)
+    assert result.error is None and result.text == "Wrote a.txt\n\nDone." and (tmp_path / "a.txt").read_text() == "1"
     assert model.seen[1][-1]["content"] == CONFIRM and model.seen[3][-1]["content"] == CONFIRM
 
 
 def test_repl_agent_restarts_a_stuck_block_and_respects_limits(tmp_path):
     model = ScriptedModel([repl("y = 1\nimport time; time.sleep(30)"), repl("print('y' in dir())"), "done", "done"])
     started = time.monotonic()
-    result = asyncio.run(ReplAgent(model, block_timeout=1).run(tmp_path, "go"))
+    result = prompt(ReplAgent(model, block_timeout=1), "go", tmp_path)
     assert time.monotonic() - started < 10 and result.error is None
     assert "timed out after 1s" in model.seen[1][-1]["content"] and "False" in model.seen[2][-1]["content"]
 
-    costs = []
     endless = ScriptedModel([repl("pass")] * 10, cost=0.5)
-    result = asyncio.run(ReplAgent(endless).with_budget(1.0).with_meter(costs.append).run(tmp_path, "go"))
-    assert result.error == "spent its $1 budget" and costs == [0.5, 1.0]
-    result = asyncio.run(ReplAgent(ScriptedModel([repl("pass")] * 10), max_steps=3).run(tmp_path, "go"))
+    result = prompt(ReplAgent(endless), "go", tmp_path, budget=1.0)
+    assert result.error == "spent its $1 budget" and result.usage["cost_usd"] == 1.0
+    result = prompt(ReplAgent(ScriptedModel([repl("pass")] * 10), max_steps=3), "go", tmp_path)
     assert result.error == "no final reply after 3 steps" and result.usage["turns"] == 3
 
 

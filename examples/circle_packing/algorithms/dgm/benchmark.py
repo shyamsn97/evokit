@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import evokit as ek
-from evokit.agents import script_agent
+from evokit.operators import script_agent
 from evokit.files.evaluator import read_folder
 from evokit.records import merge_usage
 from evokit.util import truncate
@@ -52,16 +52,18 @@ class PackingBenchmark:
     3. Only for agents that beat the seed agent's stage 2 score: `repeats` more rounds, averaged.
 
     Every task runs in a fresh copy with a fresh evaluate.py, so an agent cannot change how it
-    is scored. The evaluation's logs hold `logs/` (what SelfModify reads) and the best N=26
-    packing as `best_main.py`. The seed agent's stage 2 score is read from the history in `storage`.
+    is scored. The evaluation's logs hold `logs/` (what self_modify reads) and the best N=26
+    packing as `best_main.py`. The seed agent's stage 2 score is read from the experiment in `dir`.
     """
 
-    def __init__(self, storage: ek.Storage, sizes=(20, 26, 32), repeats: int = 2, timeout: str = "15m"):
-        self.storage, self.sizes, self.repeats, self.timeout = storage, tuple(sizes), repeats, timeout
+    def __init__(self, dir: str | Path, sizes=(20, 26, 32), repeats: int = 2, timeout: str = "15m"):
+        self.dir, self.sizes, self.repeats, self.timeout = Path(dir), tuple(sizes), repeats, timeout
 
     def seed_score(self) -> float | None:
+        if not (self.dir / "history" / "records.jsonl").is_file():
+            return None
         return next(
-            (i.objective("stage2") for i in ek.History(self.storage).evaluated() if not i.parents and i.objective("stage2") is not None),
+            (i.objective("stage2") for i in ek.open_experiment(self.dir).evaluated() if not i.parents and i.objective("stage2") is not None),
             None,
         )
 
@@ -112,7 +114,8 @@ class PackingBenchmark:
             shutil.copy(TASK_DIR / "main.py", work / "main.py")
             shutil.copy(TASK_DIR / "evaluate.py", work / "evaluate.py")
             prompt = TASK_PROMPT.format(n=n)
-            result = await script_agent(agent_dir, timeout=self.timeout, env={"PACKING_N": str(n)}).run(work, prompt)
+            async with script_agent(agent_dir, timeout=self.timeout, env={"PACKING_N": str(n)}).session(work) as session:
+                result = await session.prompt(prompt)
             shutil.copy(TASK_DIR / "evaluate.py", work / "evaluate.py")
             main = (work / "main.py").read_text() if (work / "main.py").exists() else ""
             report = await self._score(work, n)
@@ -124,7 +127,7 @@ class PackingBenchmark:
             elif not solve.valid:
                 solve.problem = f"invalid packing: {report.get('feedback')}"
             log.write_text(
-                f"# Task (N={n})\n\n{prompt}\n\n# Agent summary\n\n{result.summary}\n\n"
+                f"# Task (N={n})\n\n{prompt}\n\n# Agent summary\n\n{result.text}\n\n"
                 f"# Agent error\n\n{result.error or 'none'}\n\n# Agent stderr\n\n{truncate(result.trace or '', 8000)}\n\n"
                 f"# evaluate.py\n\n{json.dumps(report)}\n\n# main.py\n\n```python\n{main}\n```\n"
             )

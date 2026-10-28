@@ -11,7 +11,7 @@ from evokit.util import new_id
 @dataclass(frozen=True)
 class Evaluation:
     """The result of evaluating an individual. No objectives means the evaluation failed. `logs`
-    (file name -> contents) are stored in the individual's artifact folder by `tell`, not in the
+    (file name -> contents) are stored in the individual's artifact folder by `experiment.submit`, not in the
     history."""
 
     objectives: dict[str, float] = field(default_factory=dict)
@@ -73,40 +73,6 @@ class Individual:
     def objective(self, name: str) -> float | None:
         """The value of one objective, or None if it is unevaluated, failed, or has no such objective."""
         return None if self.evaluation is None else self.evaluation.objectives.get(name)
-
-
-@dataclass(frozen=True)
-class Selection:
-    """What a strategy picks for one child-to-be."""
-
-    parents: tuple[Individual, ...]
-    inspirations: tuple[Individual, ...] = ()
-
-
-@dataclass(frozen=True)
-class Offspring:
-    """What an operator returns. `logs` (file name -> contents), e.g. an agent's transcript, are
-    stored in each child's artifact folder."""
-
-    children: tuple[Individual, ...]
-    usage: dict[str, float] = field(default_factory=dict)
-    logs: Mapping[str, bytes] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Failure:
-    """An operator call that produced nothing."""
-
-    selection: Selection
-    reason: str
-    usage: dict[str, float] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Asked:
-    individuals: tuple[Individual, ...]
-    failures: tuple[Failure, ...] = ()
-    exhausted: bool = False
 
 
 def merge_usage(*usages: Mapping[str, Any] | None) -> dict[str, float]:

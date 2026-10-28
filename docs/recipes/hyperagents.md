@@ -48,7 +48,7 @@ class MetaAgentModify(Operator):
                 meta = root / "meta"
                 self.fixed_meta_agent.write_to(meta)
             argv = [sys.executable, str(meta / self.entrypoint), "--repo", str(root / "repo"), "--history", str(root / "history")]
-            result = await CommandAgent(argv, self.timeout).run(root / "repo", "")
+            result = await CommandAgent(argv, self.timeout).run("", cwd=root / "repo")
             if result.error:
                 raise OperatorError(f"the meta agent failed: {result.error}", usage=result.usage)
             child = Files.from_directory(root / "repo")

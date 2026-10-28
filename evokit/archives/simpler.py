@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from evokit.archives.best import BestArchive
 from evokit.records import Individual
-from evokit.storage import Storage
 from evokit.util import as_float
 
 
@@ -12,15 +11,14 @@ class SimplerBestArchive(BestArchive):
 
     def __init__(
         self,
-        objective: str = "score",
+        objective: str | None = None,
         size: str = "lines",
         tolerance: float = 1e-6,
-        minimize: bool = False,
+        minimize: bool | None = None,
         *,
-        storage: Storage | None = None,
         name: str = "archive",
     ):
-        super().__init__(objective, minimize, storage=storage, name=name)
+        super().__init__(objective, minimize, name=name)
         self.size = size
         self.tolerance = tolerance
 

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import difflib
-import random
 from typing import Mapping, Sequence
 
 from evokit.archives.ranked import RankedArchive
 from evokit.records import Individual
-from evokit.storage import Storage
 from evokit.util import as_float
 
 
@@ -26,7 +24,8 @@ class IslandArchive(RankedArchive):
     "diversity", the mean edit distance to a sample of the island. A cell keeps its `cell_size`
     best individuals; with features=() each island is one population of that size.
     Each member's metadata is {"island": i, "cell": [...]}. `migrate(top)` copies each island's
-    top individuals to the next island in a ring; the recipe decides when.
+    top individuals to the next island in a ring; the recipe decides when. `sample` takes the
+    islands in turn: each call picks from one island's members, best first.
     """
 
     def __init__(
@@ -37,18 +36,17 @@ class IslandArchive(RankedArchive):
         ranges: Mapping[str, tuple[float, float]] | None = None,
         cell_size: int = 1,
         diversity_sample: int = 8,
-        objective: str = "score",
-        minimize: bool = False,
+        objective: str | None = None,
+        minimize: bool | None = None,
         seed: int = 0,
         *,
-        storage: Storage | None = None,
         name: str = "archive",
     ):
-        super().__init__(objective, minimize, storage=storage, name=name)
+        super().__init__(objective, minimize, name=name, seed=seed)
         self.islands, self.features, self.bins, self.cell_size = islands, tuple(features), bins, cell_size
         self.ranges = {"lines": (0.0, 150.0), "diversity": (0.0, 1.0), **(ranges or {})}
         self.diversity_sample = diversity_sample
-        self._rng = random.Random(seed)
+        self.turn = 0
 
     def island_of(self, id: str) -> int | None:
         meta = self.metadata.get(id)
@@ -56,6 +54,14 @@ class IslandArchive(RankedArchive):
 
     def island_members(self, island: int) -> list[Individual]:
         return self.rank([self._members[id] for id, m in self.metadata.items() if m["island"] == island])
+
+    def candidates(self) -> list[Individual]:
+        """The next island's members (islands take turns), best first."""
+        for _ in range(self.islands):
+            island, self.turn = self.turn % self.islands, self.turn + 1
+            if members := self.island_members(island):
+                return members
+        return []
 
     def niches(self) -> dict[tuple, list[Individual]]:
         """Members grouped by (island, cell), each best first."""
@@ -68,7 +74,7 @@ class IslandArchive(RankedArchive):
         others = [m for m in self.island_members(island) if m.id != individual.id]
         if not others:
             return 0.0
-        sample = self._rng.sample(others, min(self.diversity_sample, len(others)))
+        sample = self.rng.sample(others, min(self.diversity_sample, len(others)))
         text = genome_text(individual)
         return sum(1 - difflib.SequenceMatcher(None, text, genome_text(m)).ratio() for m in sample) / len(sample)
 

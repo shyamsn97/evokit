@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from evokit.files.project import Project
 from evokit.files.tree import Files
-from evokit.loop import as_eval_fn
+from evokit.evaluate import as_evaluate
 from evokit.records import Evaluation, Individual
 from evokit.util import parse_duration, reaped, spawned, truncate
 
@@ -47,7 +47,7 @@ class ScriptEvaluator:
     """An eval function: write the project (environment + genome) to a fresh directory and run
     a command there.
 
-        eval_fn = ScriptEvaluator(project, "python evaluate.py", timeout="2m")
+        evaluate = ScriptEvaluator(project, "python evaluate.py", timeout="2m")
 
     The command prints its metrics (a JSON object, or `name: number` lines); the numbers become
     objectives. A non-zero exit is a failed evaluation (no objectives), with stderr as feedback:
@@ -135,11 +135,11 @@ def code_lines(text: str, comment: str = "#") -> int:
     return sum(1 for line in text.splitlines() if line.strip() and not line.strip().startswith(comment))
 
 
-def with_lines(eval_fn, name: str = "lines", comment: str = "#"):
+def with_lines(evaluate, name: str = "lines", comment: str = "#"):
     """An eval function that adds an objective `name`, the code lines of the genome's files, to
-    every successful evaluation of `eval_fn`."""
+    every successful evaluation of `evaluate`."""
 
-    inner = as_eval_fn(eval_fn)
+    inner = as_evaluate(evaluate)
 
     async def evaluate_with_lines(individual: Individual) -> Evaluation:
         evaluation = await inner(individual)

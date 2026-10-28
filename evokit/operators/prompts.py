@@ -25,3 +25,23 @@ def describe_individual(individual: Individual, max_feedback: int = 2000) -> str
 def join_notes(*parts: str | None) -> str | None:
     text = "\n\n".join(p for p in parts if p)
     return text or None
+
+
+def scores_text(objectives) -> str:
+    """Objectives on one line, `score=0.96, lines=55`; "failed" if there are none."""
+    return ", ".join(f"{k}={v:.6g}" if isinstance(v, (int, float)) else f"{k}={v}" for k, v in (objectives or {}).items()) or "failed"
+
+
+def brief(individual: Individual | None) -> str:
+    """`ID (score=...)`: an individual in a few words."""
+    if individual is None:
+        return "(none)"
+    return f"{individual.id} ({scores_text(individual.evaluation.objectives if individual.evaluation else None)})"
+
+
+def format_attempts(entries) -> str:
+    """`Run.log` entries, one line each: id, scores, kept or rejected, name."""
+    return "\n".join(
+        f"- {e['id']}  {scores_text(e.get('objectives'))}  {'kept' if e.get('admitted') else 'rejected'}  {e.get('name') or ''}".rstrip()
+        for e in entries
+    )

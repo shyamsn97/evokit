@@ -134,7 +134,7 @@ default is `task.eval_fn`), and any other objects whose `@command` methods becom
 
 ## An individual
 
-Every command that returns individuals (`best-individual`, `list-individuals`,
+Every command that returns individuals (`list-individuals`,
 `evaluate-directory`) prints:
 
 ```json

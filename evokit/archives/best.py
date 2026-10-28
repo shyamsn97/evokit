@@ -4,26 +4,27 @@ from typing import Literal
 
 from evokit.archives.ranked import RankedArchive
 from evokit.records import Individual
-from evokit.storage import Storage
+from evokit.strategies import best
 
 
 class BestArchive(RankedArchive):
     """Keep a single best individual.
 
     ties="accept" also admits equal scores, so the lineage moves forward on non-regressing
-    changes (AVO's commit rule when the evaluator fails incorrect programs).
+    changes (AVO's commit rule when the evaluator fails incorrect programs). `sample` gives the best.
     """
+
+    strategy = staticmethod(best)
 
     def __init__(
         self,
-        objective: str = "score",
-        minimize: bool = False,
+        objective: str | None = None,
+        minimize: bool | None = None,
         ties: Literal["reject", "accept"] = "reject",
         *,
-        storage: Storage | None = None,
         name: str = "archive",
     ):
-        super().__init__(objective, minimize, storage=storage, name=name)
+        super().__init__(objective, minimize, name=name)
         if ties not in ("reject", "accept"):
             raise ValueError("ties must be 'reject' or 'accept'")
         self.ties = ties

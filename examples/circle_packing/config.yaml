@@ -1,6 +1,7 @@
 # Circle packing as an evokit task. From examples/circle_packing:
-#   evokit status --task . --dir runs/x        # creates the run (seeded with main.py), then continues it
-# The scripts in algorithms/ load this folder with `evokit.load_task` and run the published algorithms.
+#   evokit status --task . --dir runs/x          # creates an experiment (seeded with main.py), then continues it
+#   evokit run . --dir runs/avo                  # runs the recipe below with Claude Code
+# The scripts in algorithms/ load this folder with `evokit.Task.from_directory` and run the published algorithms.
 
 task:
   genome: [main.py]
@@ -10,9 +11,7 @@ task:
   minimize: false
   ignore: [algorithms/**, compare.py]
 
-run:                            # what the CLI builds: you (or your agent) are the operator
-  archive: best
-  strategy: greedy
-  operator: none
-  # operator: coding-agent      # or let Claude Code make each change: `evokit run --dir runs/x`
-  # agent: claude
+recipe:
+  name: avo
+  agent: claude
+  max_cost: 5

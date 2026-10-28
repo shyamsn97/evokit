@@ -35,8 +35,10 @@ FAKE_AGENT = textwrap.dedent(
         open("evaluate.py", "a").write("# tampered\\n")
     redirect = "Step back" in prompt
     resumed = sys.argv[1] if len(sys.argv) > 1 else ""
-    print(json.dumps({"summary": f"x -> {x + 0.5}; draft={draft and draft.get('objectives')}; redirect={redirect}; resumed={resumed}",
-                      "cost_usd": 0.01, "tokens": 100, "session": resumed or "sess-1"}))
+    summary = f"x -> {x + 0.5}; draft={draft and draft.get('objectives')}; redirect={redirect}; resumed={resumed}"
+    if "evokit finish" in prompt:
+        subprocess.run(["evokit", "finish", "--title", summary, "--description", "bumped X"], capture_output=True)
+    print(json.dumps({"summary": summary, "cost_usd": 0.01, "tokens": 100, "session": resumed or "sess-1"}))
     """
 )
 

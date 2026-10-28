@@ -17,63 +17,57 @@ import asyncio
 import os
 from typing import Mapping
 
-from algorithms.common import arguments, model, packing_task, report, seed_archive
+from dataclasses import replace
+
+from algorithms.common import arguments, model, packing_task, report
 
 import evokit as ek
 from evokit import recipes
 from evokit.archives import IslandArchive
-from evokit.files import ScriptEvaluator, with_lines
+from evokit.files import ScriptEvaluator
 from evokit.recipes.dgm import staged_eval
-from evokit.storages import DirectoryStorage
 
 VARIANTS = ("full", "one-island", "no-inspirations", "single-model", "no-grid")
 ARCHIVE_SWAPS = {"one-island": {"islands": 1}, "no-grid": {"features": (), "cell_size": 50}}
 RECIPE_SWAPS = {"no-inspirations": {"inspirations": 0}}
 
 
-def cascade_evaluate(project):
+def cascade_evaluate(files):
     """Stage 1 runs evaluate.py with a 30 s limit: crashes and invalid packings fail cheaply.
-    Only programs that ran out of time get stage 2, the same check with the task's 5 minute limit.
-    Adds `lines`, one of the grid's features."""
-    quick = ScriptEvaluator(project, "python evaluate.py", timeout="30s")
-    full = ScriptEvaluator(project, "python evaluate.py", timeout="5m")
+    Only programs that ran out of time get stage 2, the same check with the task's 5 minute limit."""
+    quick = ScriptEvaluator(files, "python evaluate.py", timeout="30s")
+    full = ScriptEvaluator(files, "python evaluate.py", timeout="5m")
     timed_out = lambda evaluation: not evaluation.objectives and "exceeded" in evaluation.feedback  # noqa: E731
-    return with_lines(staged_eval(quick, full, promote=timed_out))
+    return staged_eval(quick, full, promote=timed_out)
 
 
 async def run(
-    directory: str,
+    dir: str,
     variant: str = "full",
     models: Mapping[str, ek.operators.Model] | None = None,
     workers: int = 8,
     max_evaluations: int = 300,
     max_cost: float | None = 5.0,
-):
+) -> ek.Individual | None:
     if variant not in VARIANTS:
         raise ValueError(f"variant must be one of {VARIANTS}")
-    storage = DirectoryStorage(directory)
-    history = ek.History(storage)
-    task = packing_task(storage)
+    task = packing_task()
+    task = replace(task, evaluate=cascade_evaluate(task.files))
     models = models or {
         "fast": model(os.environ.get("EVOKIT_FAST_MODEL", "claude-haiku-4-5")),
         "strong": model(os.environ.get("EVOKIT_STRONG_MODEL", "claude-sonnet-4-5")),
     }
     if variant == "single-model":
         models = {"fast": models["fast"]}
-    eval_fn = cascade_evaluate(task.project)
-    archive = IslandArchive(storage=storage, **ARCHIVE_SWAPS.get(variant, {}))
-    await seed_archive(history, archive, task.project.seed_genome(), eval_fn)
-    await recipes.openevolve(
-        task.project, eval_fn, models, weights={"fast": 0.8, "strong": 0.2}, history=history, archive=archive,
-        instructions=task.instructions, workers=workers, max_evaluations=max_evaluations, max_cost=max_cost,
-        **RECIPE_SWAPS.get(variant, {}),
+    return await recipes.openevolve(
+        task, models, weights={"fast": 0.8, "strong": 0.2}, dir=dir, archive=IslandArchive(**ARCHIVE_SWAPS.get(variant, {})),
+        workers=workers, max_evaluations=max_evaluations, max_cost=max_cost, **RECIPE_SWAPS.get(variant, {}),
     )
-    return storage, archive
 
 
-def print_curve(storage: ek.Storage, every: int = 25) -> None:
+def print_curve(dir: str, every: int = 25) -> None:
     best, points = None, []
-    evaluated = ek.History(storage).evaluated()
+    evaluated = ek.open_experiment(dir).evaluated()
     for k, individual in enumerate(evaluated, 1):
         score = individual.objective("score")
         if score is not None and (best is None or score > best):
@@ -85,9 +79,10 @@ def print_curve(storage: ek.Storage, every: int = 25) -> None:
 
 def main() -> None:
     args = arguments("AlphaEvolve / OpenEvolve on circle packing", variants=VARIANTS, workers=8, max_evaluations=300, max_cost=5.0)
-    storage, archive = asyncio.run(run(args.dir, args.variant, workers=args.workers, max_evaluations=args.max_evaluations, max_cost=args.max_cost))
-    report(storage, archive)
-    print_curve(storage)
+    asyncio.run(run(args.dir, args.variant, workers=args.workers, max_evaluations=args.max_evaluations, max_cost=args.max_cost))
+    report(args.dir)
+    print_curve(args.dir)
+    archive = ek.open_experiment(args.dir).archive
     for island in range(archive.islands):
         print(archive.table(island))
 

@@ -2,7 +2,7 @@
 this file (`ReplProcess` passes its source to `python -c`), e.g. the task's Python with numpy.
 
 - `Repl` is the interpreter: one namespace; `run(code)` returns what the block printed. With
-  EVOKIT_TOOLS set (by `ToolServer`), the namespace also has the agent's tools as functions.
+  EVOKIT_TOOLS set (by `ShellTools`), the namespace also has the agent's tools as functions.
 - `serve()` runs a `Repl` over stdin and stdout, one JSON line per block.
 """
 
@@ -29,7 +29,7 @@ def sh(command, timeout=None):
 
 
 def tools(spec):
-    """Functions calling the tools a `ToolServer` serves, from its EVOKIT_TOOLS: {"port", "tools"}."""
+    """Functions calling the tools `ShellTools` serves, from its EVOKIT_TOOLS: {"port", "tools"}."""
     spec = json.loads(spec)
 
     def tool(name, signature):

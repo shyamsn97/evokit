@@ -1,15 +1,16 @@
 """Tools: plain functions an agent calls while it works, and how an agent in another process calls them.
 
-`agent_tools(...)` is the one place the standard tools are listed: read the population and the
-run, score a version, and (for an agent that decides what is kept) submit one. `CodingAgent.run`
-takes any list of functions as `tools=` and serves them through a `ToolServer`: the agent's shell
-gets an `evokit` command (`evokit NAME ARGS...`), and ReplAgent's Python gets functions of the
-same names. A tool's name, parameters and docstring are what the agent is told.
+A session's tools are the functions it was given (`experiment.start` gives an agent the
+experiment's: read it, remember, score, submit). `ShellTools` serves them as an `evokit` command
+on the agent's PATH (`evokit NAME ARGS...`), and ReplAgent's Python gets functions of the same
+names. A tool's name, parameters and docstring are what the agent is told.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import datetime as _dt
 import functools
 import inspect
 import json
@@ -22,139 +23,12 @@ import typing
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from evokit.errors import EvoError, UsageError
-from evokit.loop import as_eval_fn, submit as submit_individual
+from evokit.errors import UsageError
 from evokit.records import Evaluation, Individual
-from evokit.util import NAME_LIMIT, title_and_body, truncate
 
 logger = logging.getLogger("evokit")
 
 Tool = Callable[..., Any]
-
-
-def best(archive) -> dict | None:
-    """The best individual in the population: its id, name and scores."""
-    found = archive.best()
-    return _summary(found) if found else None
-
-
-def members(archive, top: int | None = None) -> list[dict]:
-    """The population, best first: each member's id, name and scores."""
-    return [_summary(m) for m in archive.members()[:top]]
-
-
-def log(history, id: str | None = None, all: bool = False, limit: int | None = 20) -> list[dict]:
-    """ID and its ancestors, nearest first, with names and scores, like `git log`; without ID, from
-    the last individual the archive admitted. With --all, every evaluated individual, newest first,
-    rejected ones too; `member` says whether it is still in the archive."""
-    return history.log(history.lookup(id) if id else None, all=all, limit=limit)
-
-
-def show(history, id: str, path: str | None = None) -> Any:
-    """An individual's name, description, parents, evaluation and files; with PATH, that file."""
-    return history.show(history.lookup(id), path)
-
-
-def diff(history, a: str, b: str | None = None) -> str:
-    """What changed from A to B, as a unified diff; with only A, from its parent to A."""
-    return history.diff(history.lookup(a), history.lookup(b) if b else None)
-
-
-def grep(history, pattern: str, limit: int = 20) -> list[dict]:
-    """Individuals whose name, description or files match a regex, rejected ones too, so you can
-    see what was already tried and how it scored."""
-    return history.grep(pattern, limit)
-
-
-READ_TOOLS = (log, show, diff, grep)
-"""The tools that read a run's history, like git; each takes the History first."""
-
-
-def agent_tools(
-    archive,
-    history=None,
-    eval_fn=None,
-    *,
-    project=None,
-    workspace: Path | None = None,
-    parents: Callable[[], list[str]] | None = None,
-    submit: bool = False,
-    info: Mapping[str, Any] | None = None,
-) -> list[Tool]:
-    """The tools every agent gets.
-
-    Always: `best` and `members` (the population). With a `history`: `log`, `show`, `diff` and
-    `grep` (the run). With an `eval_fn`: `score`, which scores a version and keeps nothing (its
-    cost is noted in the history). With `submit=True` (an agent that decides what is kept, like
-    AVO's): `submit`, which scores a version and offers it to the archive.
-
-    With a `project` and `workspace`, the version scored or submitted is the workspace's files,
-    with `parents()` as its parents (default: the archive's best); otherwise the agent passes the
-    genome itself, as JSON. `info` goes into every submitted individual's info.
-    """
-    files = project is not None and workspace is not None
-    default_parents = parents or (lambda: [archive.best().id] if archive.best() else [])
-    tools: list[Tool] = [functools.partial(best, archive), functools.partial(members, archive)]
-    if history is not None:
-        tools += [functools.partial(tool, history) for tool in READ_TOOLS]
-
-    if eval_fn is not None:
-        score_fn = as_eval_fn(eval_fn)
-
-        async def _score(genome) -> dict:
-            evaluation = await score_fn(Individual.new(genome, default_parents(), {"operator": "draft"}))
-            if history is not None:
-                history.note("draft", _scores(evaluation), {**evaluation.usage, "draft_evals": 1})
-            return _evaluation(evaluation)
-
-        if files:
-
-            async def score() -> dict:
-                """Score the files in your working directory as they are now, without keeping them."""
-                return await _score(await asyncio.to_thread(project.read, workspace))
-
-        else:
-
-            async def score(genome: Any) -> dict:
-                """Score a genome (as JSON) without keeping it."""
-                return await _score(genome)
-
-        tools.append(score)
-
-    if submit:
-        if history is None or eval_fn is None:
-            raise ValueError("submit needs a history and an eval_fn")
-
-        async def _submit(genome, parent_ids, name, description) -> dict:
-            if len(name) > NAME_LIMIT or "\n" in name:
-                name, rest = title_and_body(name)
-                description = "\n\n".join(p for p in (rest, description) if p)
-            description = truncate(description, 4000)
-            child = Individual.new(genome, parent_ids, dict(info or {}), name=name, description=description)
-            result = await submit_individual(history, archive, eval_fn, child)
-            return {"id": result.id, "kept": result.info["admitted"], **_evaluation(result.evaluation)}
-
-        if files:
-
-            async def submit(name: str, description: str = "") -> dict:
-                """Score the files in your working directory and offer them to the population: `kept` says
-                whether they were kept. `name` is one line saying what this version is, `description` what
-                changed and why."""
-                genome = await asyncio.to_thread(project.read, workspace)
-                best = archive.best()
-                if best is not None and genome == best.genome:
-                    raise UsageError("nothing changed since the best version", hint="edit the files first")
-                return await _submit(genome, default_parents(), name, description)
-
-        else:
-
-            async def submit(genome: Any, name: str, description: str = "", parents: list[str] | None = None) -> dict:
-                """Score a genome (as JSON) and offer it to the population: `kept` says whether it was kept."""
-                return await _submit(genome, parents if parents is not None else default_parents(), name, description)
-
-        tools.append(submit)
-
-    return tools
 
 
 def limited(tool: Tool, n: int) -> Tool:
@@ -172,21 +46,6 @@ def limited(tool: Tool, n: int) -> Tool:
     return limited_tool
 
 
-def _summary(individual: Individual) -> dict:
-    out: dict[str, Any] = {"id": individual.id, "name": individual.name, "parents": list(individual.parents)}
-    if individual.evaluation is not None:
-        out["objectives"] = dict(individual.evaluation.objectives)
-    return out
-
-
-def _evaluation(evaluation: Evaluation) -> dict:
-    return {"objectives": dict(evaluation.objectives), "feedback": truncate(evaluation.feedback, 4000)}
-
-
-def _scores(evaluation: Evaluation) -> str:
-    return ", ".join(f"{k}={v:.6g}" for k, v in evaluation.objectives.items()) or "failed"
-
-
 # calling a tool from text arguments
 
 
@@ -199,8 +58,14 @@ def tool_doc(tool: Tool) -> str:
     return inspect.getdoc(getattr(tool, "func", tool)) or ""
 
 
+def tool_summary(tool: Tool) -> str:
+    """The first paragraph of a tool's docstring, on one line."""
+    return " ".join(tool_doc(tool).split("\n\n")[0].split())
+
+
 def _hints(tool: Tool) -> dict[str, Any]:
     fn = inspect.unwrap(getattr(tool, "func", tool))
+    fn = inspect.unwrap(getattr(fn, "func", fn))  # a wrapped functools.partial
     try:
         return typing.get_type_hints(fn)
     except Exception:
@@ -235,7 +100,9 @@ def _is_list(hint: Any) -> bool:
 
 
 def _positional(param: inspect.Parameter, hint: Any) -> bool:
-    """Required parameters, and optional text ones, can be given without their --name."""
+    """Required parameters, and optional text ones that are not keyword-only, can be given without their --name."""
+    if param.kind is param.KEYWORD_ONLY:
+        return False
     return param.default is param.empty or (_is(hint, str) and not _is_list(hint))
 
 
@@ -319,19 +186,35 @@ def describe(tools: Sequence[Tool], style: str = "shell") -> str:
 
 
 def encode(value: Any) -> Any:
-    """JSON-compatible data for a tool's result."""
+    """JSON-compatible data for a tool's or command's result."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, Individual):
-        return {**_summary(value), "description": value.description}
+        return {
+            "id": value.id,
+            "name": value.name,
+            "description": value.description,
+            "genome": encode(value.genome),
+            "parents": list(value.parents),
+            "evaluation": encode(value.evaluation),
+            "info": encode(dict(value.info)),
+        }
     if isinstance(value, Evaluation):
-        return _evaluation(value)
-    if isinstance(value, Mapping):
+        return value.to_dict()
+    if hasattr(value, "describe"):
+        return encode(value.describe())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {f.name: encode(getattr(value, f.name)) for f in dataclasses.fields(value)}
+    if isinstance(value, dict):
         return {str(k): encode(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [encode(v) for v in value]
-    if isinstance(value, Path):
-        return str(value)
+    if hasattr(value, "to_dict"):
+        return encode(value.to_dict())
     return repr(value)
 
 
@@ -364,34 +247,25 @@ else:
 """
 
 
-class ToolServer:
-    """`tools` on a localhost socket, for an agent running in another process.
+class ShellTools:
+    """A session's tools as an `evokit` command on PATH (`evokit NAME ARGS...`, `evokit help`), for an
+    agent in another process. `env` puts the command on the agent's PATH and tells ReplAgent's
+    Python where to find the tools (EVOKIT_TOOLS). Every call goes to `session.call`."""
 
-    `env` puts an `evokit` command on the agent's PATH (`evokit NAME ARGS...`, `evokit help`) and
-    tells ReplAgent's Python where to find them. `stop()` returning a reason refuses every call and
-    is added to every reply as `stop`; `messages()` returning text adds it to the next reply as
-    `message` (e.g. a supervisor's directions).
-    """
-
-    def __init__(
-        self,
-        tools: Sequence[Tool],
-        stop: Callable[[], str | None] | None = None,
-        messages: Callable[[], str | None] | None = None,
-    ):
-        self.tools = {tool_name(t): t for t in tools}
-        self.stop, self.messages = stop, messages
+    def __init__(self, session):
+        self.session = session
         self._server: asyncio.AbstractServer | None = None
         self._dir = Path(tempfile.mkdtemp(prefix="evokit-tools-"))
         self.env: dict[str, str] = {}
 
-    async def __aenter__(self) -> "ToolServer":
+    async def __aenter__(self) -> "ShellTools":
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         port = self._server.sockets[0].getsockname()[1]
         script = self._dir / "evokit"
         script.write_text(SCRIPT.format(python=sys.executable, port=port))
         script.chmod(0o755)
-        spec = {"port": port, "tools": {name: str(inspect.signature(t)) for name, t in self.tools.items()}}
+        tools = {"finish": "(**fields)"} | {name: str(inspect.signature(t)) for name, t in self.session.tools.items()}
+        spec = {"port": port, "tools": tools}
         self.env = {"PATH": f"{self._dir}{os.pathsep}{os.environ.get('PATH', '')}", "EVOKIT_TOOLS": json.dumps(spec)}
         return self
 
@@ -401,46 +275,22 @@ class ToolServer:
             await self._server.wait_closed()
         shutil.rmtree(self._dir, ignore_errors=True)
 
-    async def handle(self, name: str, argv: Sequence[str] | None = None, args=(), kwargs=None) -> dict:
-        """One call: by command-line words (`argv`) or by Python arguments."""
+    async def handle(self, request: Mapping[str, Any]) -> dict:
+        """One request: {"tool", "argv"} from the command, or {"tool", "args", "kwargs"} from Python."""
+        name = request.get("tool", "")
         if name == "help":
-            return {"result": describe(list(self.tools.values()))}
-        tool = self.tools.get(name)
-        if tool is None:
-            return {"error": f"unknown tool {name!r}", "hint": f"tools: {', '.join(self.tools)}"}
-        reason = self.stop() if self.stop else None
-        if reason:
-            return {"error": f"the run is over ({reason}); stop now", "stop": reason}
-        try:
-            if argv is not None:
-                kwargs = parse_argv(tool, argv)
-            else:
-                try:
-                    kwargs = dict(inspect.signature(tool).bind(*args, **(kwargs or {})).arguments)
-                except TypeError as exc:
-                    raise UsageError(str(exc), hint=f"{name}{inspect.signature(tool)}") from None
-            reply: dict[str, Any] = {"result": encode(await call(tool, kwargs))}
-        except EvoError as exc:
-            reply = {"error": exc.message, **({"hint": exc.hint} if exc.hint else {})}
-        except Exception as exc:
-            logger.exception("tool %s failed", name)
-            reply = {"error": f"{type(exc).__name__}: {exc}"}
-        if self.messages and (message := self.messages()):
-            reply["message"] = message
-        if self.stop and (reason := self.stop()):
-            reply["stop"] = reason
-        return reply
+            return {"result": describe(list(self.session.tools.values()))}
+        if request.get("argv") is not None:
+            return await self.session.call_argv(name, request["argv"])
+        return await self.session.call(name, request.get("kwargs") or {}, request.get("args") or ())
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            request = json.loads(await reader.readline() or b"{}")
-            reply = await self.handle(
-                request.get("tool", ""), request.get("argv"), request.get("args") or (), request.get("kwargs")
-            )
+            reply = await self.handle(json.loads(await reader.readline() or b"{}"))
             writer.write(json.dumps(reply, default=str).encode())
             await writer.drain()
         finally:
             writer.close()
 
 
-__all__ = ["READ_TOOLS", "Tool", "ToolServer", "agent_tools", "describe", "limited", "parse_argv", "tool_doc", "tool_name", "usage"]
+__all__ = ["ShellTools", "Tool", "call", "describe", "encode", "limited", "parse_argv", "tool_doc", "tool_name", "tool_summary", "usage"]

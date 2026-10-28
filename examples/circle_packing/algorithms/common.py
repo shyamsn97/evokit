@@ -1,4 +1,4 @@
-"""What the algorithm examples share: the circle-packing task folder, models, seeding and run flags."""
+"""What the algorithm examples share: the circle-packing task, models, agents and flags."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 import evokit as ek
-from evokit.agents import ClaudeCode, CodingAgent, ReplAgent
+from evokit.agents import NO_SHELL, ClaudeCode, Agent, ReplAgent
 from evokit.operators import AnthropicModel, OpenAIModel
 
 CIRCLE_PACKING = Path(__file__).resolve().parents[1]
@@ -23,10 +23,10 @@ PRICES = {
 }
 
 
-def packing_task(storage: ek.Storage) -> ek.Task:
-    """examples/circle_packing as a Task: main.py evolves, and evaluate.py (copied into the run
-    directory's env/) scores it; an invalid packing exits non-zero, so it is never admitted."""
-    return ek.load_task(CIRCLE_PACKING, environment=Path(storage.root) / "env")
+def packing_task() -> ek.Task:
+    """examples/circle_packing as a Task: main.py evolves, and evaluate.py scores it; an invalid
+    packing exits non-zero, so it is never admitted."""
+    return ek.Task.from_directory(CIRCLE_PACKING)
 
 
 def model(name: str | None = None) -> AnthropicModel:
@@ -35,14 +35,16 @@ def model(name: str | None = None) -> AnthropicModel:
 
 
 def claude_code(max_turns: int = 40, timeout: str = "1h") -> ClaudeCode:
-    """Claude Code with its own login (EVOKIT_AGENT_AUTH=env uses ANTHROPIC_API_KEY instead)."""
+    """Claude Code with its own login (EVOKIT_AGENT_AUTH=env uses ANTHROPIC_API_KEY instead).
+    EVOKIT_AGENT_NO_SHELL=1 lets it run code only through evokit score and submit."""
     return ClaudeCode(
         model=os.environ.get("EVOKIT_AGENT_MODEL", "sonnet"), max_turns=max_turns, timeout=timeout,
         auth=os.environ.get("EVOKIT_AGENT_AUTH", "login"),
+        allowed_tools=NO_SHELL if os.environ.get("EVOKIT_AGENT_NO_SHELL") == "1" else None,
     )
 
 
-def coding_agent(spec: str, long: bool = False) -> CodingAgent:
+def coding_agent(spec: str, long: bool = False) -> Agent:
     """`claude` (Claude Code), or `repl:MODEL` (ReplAgent on an OpenAI model, e.g. repl:gpt-5-mini).
     `long` is for one session that lasts a whole run (AVO)."""
     if spec == "claude":
@@ -53,21 +55,9 @@ def coding_agent(spec: str, long: bool = False) -> CodingAgent:
     raise SystemExit(f"unknown agent {spec!r}: use claude or repl:MODEL")
 
 
-async def seed_archive(history: ek.History, archive: ek.Archive, genome, eval_fn) -> None:
-    """A fresh run starts from `genome`; a continued run's archive has restored itself."""
-    if archive.members():
-        return
-    seed = ek.Individual.new(genome, name="seed")
-    evaluation = await ek.as_eval_fn(eval_fn)(seed)
-    await ek.tell(history, archive, [seed], [evaluation])
-    if not archive.members():
-        feedback = evaluation.feedback
-        raise SystemExit(f"the seed failed its evaluation:\n{feedback[:2000]}")
-
-
 def arguments(description: str, variants=(), **defaults) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--dir", required=True, help="run directory (continues the run if it exists)")
+    parser.add_argument("--dir", required=True, help="experiment directory (continues the experiment if it exists)")
     if variants:
         parser.add_argument("--variant", choices=list(variants), default=variants[0])
     parser.add_argument("--workers", type=int, default=defaults.get("workers", 1))
@@ -78,14 +68,14 @@ def arguments(description: str, variants=(), **defaults) -> argparse.Namespace:
     return parser.parse_args()
 
 
-def report(storage: ek.Storage, archive: ek.Archive) -> ek.Individual | None:
-    """Print what the run did, and write the best main.py next to it."""
-    history = ek.History(storage)
-    counts, usage = history.counts(), history.usage()
+def report(dir: str) -> ek.Individual | None:
+    """Print what the experiment did, and write the best main.py next to it."""
+    experiment = ek.open_experiment(dir)
+    counts, usage = experiment.counts(), experiment.usage()
     print(f"{counts['evaluated']} evaluations ({counts['added']} admitted), ${usage['cost_usd']:.2f}")
-    best = archive.best()
+    best = experiment.best()
     if best is not None:
         print(f"best: {best.id} score {best.objective('score')}")
         if "main.py" in best.genome:
-            storage.write("best_main.py", best.genome.text("main.py").encode())
+            experiment.storage.write("best_main.py", best.genome.text("main.py").encode())
     return best

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from evokit.archives.ranked import RankedArchive
 from evokit.records import Individual
+from evokit.strategies import best
 
 
 class UnboundedArchive(RankedArchive):
@@ -16,6 +17,8 @@ class UnboundedArchive(RankedArchive):
 
 class LatestArchive(RankedArchive):
     """Keep only the newest individual that has a score (the DGM ablation without open-ended exploration)."""
+
+    strategy = staticmethod(best)
 
     def add(self, individual: Individual) -> bool:
         if self.score(individual) is None:

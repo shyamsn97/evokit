@@ -1,4 +1,4 @@
-"""Score each run's best solve.py on its problem's held-out test instances.
+"""Score each experiment's best solve.py on its problem's held-out test instances.
 
     cd examples/co_bench
     python heldout.py runs/bin-packing-autoresearch-0 runs/bin-packing-avo-0
@@ -14,14 +14,13 @@ import json
 import subprocess
 from pathlib import Path
 
-from evokit.history import History
-from evokit.storages import DirectoryStorage
+import evokit as ek
 
 
-def best(storage) -> tuple[object, float] | None:
+def best(experiment) -> tuple[object, float] | None:
     scored = [
         (i, i.objective("score"))
-        for i in History(storage).evaluated()
+        for i in experiment.evaluated()
         if i.objective("score") is not None
     ]
     return max(scored, key=lambda pair: pair[1]) if scored else None
@@ -32,9 +31,9 @@ SCORE_TEST = "import json, sys; from evaluate import score; print(json.dumps(sco
 
 def test_run(directory: str | Path) -> dict:
     shown, directory = str(directory), Path(directory).resolve()
-    storage = DirectoryStorage(directory)
+    experiment = ek.open_experiment(directory)
     env = directory / "env"
-    counts, usage = History(storage).counts(), History(storage).usage()
+    counts, usage = experiment.counts(), experiment.usage()
     problem = json.loads((env / "problem.json").read_text())["problem"]
     row = {
         "run": shown,
@@ -42,7 +41,7 @@ def test_run(directory: str | Path) -> dict:
         "evaluations": counts["evaluated"],
         "cost_usd": usage.get("cost_usd", 0.0),
     }
-    found = best(storage)
+    found = best(experiment)
     if found is None:
         return {**row, "dev": None, "test": None, "feasible": None}
     individual, dev = found

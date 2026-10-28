@@ -104,5 +104,9 @@ class DirectoryStorage(Storage):
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    @property
+    def key(self) -> str:
+        return f"directory:{self.root}"
+
     def __repr__(self) -> str:
         return f"DirectoryStorage({str(self.root)!r})"

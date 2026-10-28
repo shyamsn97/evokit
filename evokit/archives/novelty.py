@@ -5,7 +5,6 @@ from typing import Callable, Sequence
 
 from evokit.archive import Archive
 from evokit.records import Individual
-from evokit.storage import Storage
 
 Behaviour = Callable[[Individual], Sequence[float]]
 
@@ -26,10 +25,10 @@ class NoveltyArchive(Archive):
         lower: float = 0.95,
         raise_by: float = 1.05,
         *,
-        storage: Storage | None = None,
         name: str = "archive",
+        seed: int | None = None,
     ):
-        super().__init__(storage, name)
+        super().__init__(name, seed)
         if callable(behaviour):
             self.behaviour = behaviour
         else:

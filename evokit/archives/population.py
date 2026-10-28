@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from evokit.archives.ranked import RankedArchive
 from evokit.records import Individual
-from evokit.storage import Storage
 
 
 class PopulationArchive(RankedArchive):
     """Keep the top `size` individuals (truncation selection)."""
 
-    def __init__(self, size: int, objective: str = "score", minimize: bool = False, *, storage: Storage | None = None, name: str = "archive"):
-        super().__init__(objective, minimize, storage=storage, name=name)
+    def __init__(self, size: int, objective: str | None = None, minimize: bool | None = None, *, name: str = "archive"):
+        super().__init__(objective, minimize, name=name)
         self.size = size
 
     def add(self, individual: Individual) -> bool:

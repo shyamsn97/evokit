@@ -1,5 +1,1 @@
-"""Exposure: one @command registry rendered as a CLI, an MCP server, a SKILL.md, and a tools dict."""
-
-from evokit.interface.commands import command, encode, tools
-
-__all__ = ["command", "encode", "tools"]
+"""The `evokit` command line, its MCP server and its skill, over a run directory (see interface/commands.py)."""
