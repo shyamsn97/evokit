@@ -23,6 +23,7 @@ while not experiment.limits.reached():
 ```
 
 - [Primitives](primitives.md): the pieces.
+- [Agents](agents.md): Claude Code, Codex, any CLI or model, inside the library or driving it.
 - [Recipes](recipes.md): the published algorithms.
 - [Tasks](tasks.md): task folders and the CLI.
 - [Reading runs](reading-runs.md): `log`, `show`, `diff`, `grep`.

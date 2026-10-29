@@ -43,7 +43,20 @@ async with experiment.start(agent):              # a checkout of the best, plus 
 ```
 
 The agent gets tools to read the experiment, `score` drafts, and `submit` versions. Turns are
-recorded, and the agent is stopped when a limit is reached.
+recorded, and the agent is stopped when a limit is reached. Any harness works:
+
+```python
+from evokit.agents import ClaudeCode, CommandAgent, ReplAgent
+
+ClaudeCode(model="sonnet", auth="login")              # headless `claude -p`
+CommandAgent(["codex", "exec", "{prompt}"])           # any CLI agent: Codex, cursor-agent, your script
+ReplAgent(OpenAIModel("gpt-5-mini"))                  # any chat model, writing Python in a REPL
+```
+
+You can also turn it around and let your own agent drive EvoKit: export the skill
+(`evokit skill export claude|cursor|codex`), then the agent uses the CLI, or the same commands
+over MCP (`claude mcp add evokit -- evokit mcp --dir experiments/0 --task packing`). See
+[docs/agents.md](docs/agents.md).
 
 ## Recipes
 
@@ -76,9 +89,9 @@ evokit stats --dir experiments/0
 evokit log --dir experiments/0                            # also show, diff, grep, notes
 ```
 
-An outside coding agent can be the operator: `evokit list-individuals`,
-`checkout-individual ID DIR`, then `evaluate-directory DIR --parent ID`. `evokit skill export
-claude` (or `cursor`, `codex`) installs the instructions. See [docs/tasks.md](docs/tasks.md).
+`--agent claude` (the default) or `--agent "codex exec {prompt}"` picks the harness. With an
+outside agent as the operator, it runs `evokit list-individuals`, `checkout-individual ID DIR`,
+then `evaluate-directory DIR --parent ID`. See [docs/tasks.md](docs/tasks.md).
 
 ## Examples
 
@@ -90,7 +103,7 @@ claude` (or `cursor`, `codex`) installs the instructions. See [docs/tasks.md](do
 
 ## Docs
 
-[Primitives](docs/primitives.md), [recipes](docs/recipes.md), [tasks](docs/tasks.md),
+[Primitives](docs/primitives.md), [agents](docs/agents.md), [recipes](docs/recipes.md), [tasks](docs/tasks.md),
 [reading runs](docs/reading-runs.md). Build them with
 `pip install -r docs/requirements.txt && mkdocs serve`. `docs/research/` and `docs/design/` are
 old notes.

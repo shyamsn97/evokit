@@ -8,6 +8,7 @@ copyright: Copyright (c) 2026 Shyam Sudhakaran
 nav:
   - Home: index.md
   - Primitives: primitives.md
+  - Agents: agents.md
   - Recipes:
       - recipes.md
       - autoresearch: recipes/autoresearch.md

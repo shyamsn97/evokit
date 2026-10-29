@@ -113,7 +113,8 @@ async with experiment.start(agent, start=parent, submit=True) as directory:
 
 The agent works in a checkout of `start`. Its tools are `stats`, `log`, `show`, `diff`, `grep`,
 `notes`, `remember`, `score`, and `submit` when `submit=True`. Turns are recorded, and the agent
-is stopped at a limit. `agent.fresh()` gives a read-only copy, e.g. for a reviewer.
+is stopped at a limit. `agent.fresh()` gives a read-only copy, e.g. for a reviewer. See
+[agents](agents.md) for harness options and for using your own agent from the CLI or MCP.
 
 ## Storage
 
